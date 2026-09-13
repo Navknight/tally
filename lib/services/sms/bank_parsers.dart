@@ -13,12 +13,13 @@ SmsOutcome parseBankSms({required String sender, required String body}) {
   return parser.parse(body, sender);
 }
 
+// Subclass BankParser only when a bank's wording needs its own extraction.
 final _registry = <BankParser>[
-  HdfcParser(),
-  IciciParser(),
-  SbiParser(),
-  AxisParser(),
-  KotakParser(),
+  GenericIndianBankParser('HDFC', 'HDFC'),
+  GenericIndianBankParser('ICICI', 'ICICI'),
+  GenericIndianBankParser('SBI', 'SBI'),
+  GenericIndianBankParser('Axis', 'AXIS'),
+  GenericIndianBankParser('Kotak', 'KOTAK'),
 ];
 
 final _amountRegex = RegExp(
@@ -78,14 +79,16 @@ int? _earliestIndex(String lower, List<String> words) {
 /// Baseline parser tuned on common Indian bank/UPI SMS wording. Bank-specific
 /// subclasses override only the pieces that differ.
 class GenericIndianBankParser extends BankParser {
-  GenericIndianBankParser([this._bank = 'Bank']);
+  GenericIndianBankParser([this._bank = 'Bank', this._senderKey]);
   final String _bank;
+  final String? _senderKey;
 
   @override
   String get bank => _bank;
 
   @override
-  bool canHandle(String sender) => true;
+  bool canHandle(String sender) =>
+      _senderKey == null || sender.toUpperCase().contains(_senderKey);
 
   @override
   int? extractAmount(String body) {
@@ -186,44 +189,4 @@ String _cleanMerchant(String raw, String bank) {
             : word[0].toUpperCase() + word.substring(1).toLowerCase())
         .join(' ');
   return text.isEmpty ? '$bank transaction' : text;
-}
-
-class HdfcParser extends GenericIndianBankParser {
-  @override
-  String get bank => 'HDFC';
-
-  @override
-  bool canHandle(String sender) => sender.toUpperCase().contains('HDFC');
-}
-
-class IciciParser extends GenericIndianBankParser {
-  @override
-  String get bank => 'ICICI';
-
-  @override
-  bool canHandle(String sender) => sender.toUpperCase().contains('ICICI');
-}
-
-class SbiParser extends GenericIndianBankParser {
-  @override
-  String get bank => 'SBI';
-
-  @override
-  bool canHandle(String sender) => sender.toUpperCase().contains('SBI');
-}
-
-class AxisParser extends GenericIndianBankParser {
-  @override
-  String get bank => 'Axis';
-
-  @override
-  bool canHandle(String sender) => sender.toUpperCase().contains('AXIS');
-}
-
-class KotakParser extends GenericIndianBankParser {
-  @override
-  String get bank => 'Kotak';
-
-  @override
-  bool canHandle(String sender) => sender.toUpperCase().contains('KOTAK');
 }
