@@ -35,10 +35,28 @@ class AndroidBridge {
         .toList(growable: false);
   }
 
-  static Future<String?> pickCsv() async {
+  /// Opens the system file picker for a CSV or PDF statement. Null when the
+  /// picker is unavailable, cancelled, or the host isn't Android.
+  static Future<PickedFile?> pickStatementFile() async {
     if (!Platform.isAndroid) return null;
-    return _channel.invokeMethod<String>('pickCsv');
+    final result = await _channel.invokeMapMethod<String, dynamic>(
+      'pickStatement',
+    );
+    final bytes = result?['bytes'];
+    if (bytes == null) return null;
+    return PickedFile(
+      name: result!['name'] as String? ?? 'statement',
+      bytes: bytes is Uint8List
+          ? bytes
+          : Uint8List.fromList(List<int>.from(bytes as List)),
+    );
   }
+}
+
+class PickedFile {
+  const PickedFile({required this.name, required this.bytes});
+  final String name;
+  final Uint8List bytes;
 }
 
 class BankSms {

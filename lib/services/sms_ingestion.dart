@@ -7,6 +7,7 @@ import '../platform/android_bridge.dart';
 import 'categorizer.dart';
 import 'sms/bank_parser.dart';
 import 'sms/bank_parsers.dart';
+import 'statement_import.dart';
 
 /// What one ingestion pass did, so the UI can say something truthful instead of
 /// just "done".
@@ -197,6 +198,40 @@ Future<int> recategorizeReviewQueue() async {
     settled++;
   }
   return settled;
+}
+
+/// Categorises and stores parsed statement rows against one account. No
+/// fingerprint/dedup here — a statement import is a deliberate one-off, unlike
+/// the recurring SMS feed. Returns the number of rows inserted.
+Future<int> ingestStatementRows({
+  required List<StatementRow> rows,
+  required int accountId,
+  required String source,
+}) async {
+  final db = TallyDatabase.instance;
+  final categorizer = Categorizer(db);
+  var inserted = 0;
+  for (final row in rows) {
+    final guess = row.isCredit
+        ? const CategoryGuess('Income', 1)
+        : await categorizer.guess(merchant: row.merchant);
+    if (await db.add(
+      statementRowToTransaction(
+        row,
+        accountId: accountId,
+        source: source,
+        category: guess.category,
+        needsReview: guess.needsReview,
+      ),
+    ))
+      inserted++;
+  }
+  final withBalance = rows.where((row) => row.balanceMinor != null);
+  if (withBalance.isNotEmpty) {
+    final last = withBalance.last;
+    await db.recordReportedBalance(accountId, last.balanceMinor!, last.date);
+  }
+  return inserted;
 }
 
 /// Records a user's decision: trains the learner, then sweeps every other

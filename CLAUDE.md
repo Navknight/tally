@@ -15,13 +15,15 @@ Two constraints follow from "no bloat" and should be weighed before adding anyth
 - **Local-only.** No network dependencies; everything lives in one on-device SQLite file. A network call or analytics SDK breaks the premise.
 - **Small.** Categorisation learning must stay a lightweight on-device mechanism (lookup tables and integer counts), not a bundled model. Comparable apps ship a ~1.5 GB LLM for this; Tally deliberately does not.
 
-Current code covers roughly step 1 and a first cut of step 2. Not yet built: multiple accounts (there is a single global `opening_balance` setting), PDF import, UPI-specific parsing, and any categorisation learning (SMS rows are hardcoded `Uncategorized`, CSV rows `Imported`).
+Steps 1–3 exist in a first cut: multiple accounts, CSV/PDF statement import, a per-bank SMS parser registry, and category learning with a review queue. Still weak: UPI-specific shapes beyond the generic parser, and fixtures for every bank parser.
 
 ## Working agreement
 
 - **Spend tokens sparingly.** Fan self-contained modules out to `sonnet`/`haiku` subagents with a precise interface contract in the prompt, and keep only architecture and integration in the main context. Reach for an existing tool or library before hand-rolling logic. Don't re-read files already in context or echo file contents back.
 - **Reuse the reference parsers.** Mining PennyWiseAI/Cashiro for real SMS shapes is expected — widen Tally's own regexes from them and improve on them where they're weak. Fetch raw files with `curl` rather than browsing. Keep writing Tally's own Dart: their AGPL-3.0 only binds on distribution, so a verbatim copy would force Tally to be AGPL if it ever ships.
 - **Every parsing rule ships with a fixture.** A pattern without a test in `test/` is a pattern nobody can safely change later.
+- **No AI traces.** No Co-Authored-By or "Generated with" lines in commits or PRs, and no AI-sounding prose in code, comments or docs.
+- **Releases** are `v*` tags built by `.github/workflows/release.yml` with signing secrets; the keystore password lives in the system keyring (`secret-tool lookup app tally key release-password`).
 
 ## Commands
 
@@ -35,21 +37,21 @@ flutter test --plain-name 'parses a debit SMS'   # single test by name
 flutter build apk --debug
 ```
 
-Release builds are currently signed with the debug keystore (`android/app/build.gradle.kts`).
+Release builds sign with `android/key.properties` when present, else the debug key.
 
 ## Architecture
 
-**Layers** (`lib/`): `main.dart` holds every screen and both bottom sheets; `data/` owns SQLite; `services/` parses SMS; `platform/` is the only place that touches the method channel; `core/` and `models/` are pure Dart and are what the tests cover.
+**Layers** (`lib/`): `main.dart` holds every screen and sheet; `app/theme.dart` is the Rituals-family theme; `data/` owns SQLite; `services/` holds SMS parsing (`sms/`), ingestion, statement import and the categoriser; `platform/` is the only place that touches the method channel; `core/` and `models/` are pure Dart.
 
 **Money is always `int` minor units.** Never introduce a `double` amount field. `core/money.dart` has the only formatter (`money`) and parser (`parseMoney`); the DB column is `amount_minor`.
 
-**Database** (`data/tally_database.dart`): singleton `TallyDatabase.instance`, `tally.db`, schema version 2. Two tables — `transactions` and a key/value `settings` table whose keys are `onboarded`, `currency`, `opening_balance`, `monthly_budget` (balances/budgets are strings of minor units). Bumping the schema means adding an `onUpgrade` branch *and* keeping `onCreate` in sync; version 2 added the `fingerprint` column.
+**Database** (`data/tally_database.dart`): singleton `TallyDatabase.instance`, `tally.db`, schema version 3. Tables: `transactions`, `accounts`, key/value `settings`, and the learner's `merchant_rules`, `token_stats`, `category_stats`. v3 moved the old global `opening_balance` setting into the first account. Bumping the schema means an `onUpgrade` branch *and* keeping `onCreate` in sync.
 
-**Deduplication** is a `UNIQUE INDEX` on `transactions.fingerprint` plus `ConflictAlgorithm.ignore`; `add()` returns whether a row was actually inserted, and `ingestSms` counts those returns. Imported rows must carry a stable fingerprint (`SmsParser._fingerprint`, FNV-1a over sender|body|amount); manual rows leave it null. Changing the fingerprint formula re-imports every historic SMS as duplicates.
+**Deduplication** is a `UNIQUE INDEX` on `transactions.fingerprint` plus `ConflictAlgorithm.ignore`; `add()` returns whether a row was inserted. SMS rows use `smsFingerprint` (sender|amount|hash(body), no timestamp); statement rows hash account|date|amount|direction|merchant|balance; manual rows leave it null. Changing either formula re-imports history as duplicates.
 
-**SMS flow** is pull-based, never background-writing: `SmsReceiver.kt` appends `sender\u0001timestamp\u0001body` records into the `tally_sms` SharedPreferences `pending` key (`\u0000`-separated); Dart drains and clears that queue via `takePendingSms` on `AppLifecycleState.resumed` in `_AppRootState`. `readHistoricSms` is a separate, consent-gated one-shot scan of the local SMS inbox (capped at 5000 rows) triggered from Settings. Both go through `SmsParser.parse`, which returns null for non-financial messages.
+**SMS flow** is pull-based, never background-writing: `SmsReceiver.kt` queues `sender\u0001timestamp\u0001body` records in the `tally_sms` SharedPreferences `pending` key; Dart drains it via `ingestPendingSms` on `AppLifecycleState.resumed`. `ingestHistoricSms` is a consent-gated one-shot inbox scan (capped at 5000). Both go through `parseBankSms` (`services/sms/`): `message_filter` rejects OTP/promo/requests first, then the first parser whose `canHandle(sender)` matches extracts; results are `SmsTransaction`, `SmsBalance` or `SmsIgnored`.
 
-**Method channel** `com.navknight.tally/platform` (`MainActivity.kt` ⇄ `platform/android_bridge.dart`): `requestSmsPermission`, `takePendingSms`, `readHistoricSms`, `pickCsv`. Every bridge call short-circuits on non-Android so tests and other hosts stay safe. `pickCsv` returns the file's text, or null when the picker is unavailable/cancelled — Settings then falls back to a paste sheet. CSV rows are `date,merchant,signed amount` (negative = expense), imported without fingerprints.
+**Method channel** `com.navknight.tally/platform` (`MainActivity.kt` ⇄ `platform/android_bridge.dart`): `requestSmsPermission`, `takePendingSms`, `readHistoricSms`, `pickStatement` (CSV/PDF bytes + name, null when cancelled; Settings then offers a paste-CSV sheet). Every bridge call short-circuits on non-Android.
 
 **UI refresh** is deliberately crude: `_TallyShellState._refresh` is an int bumped by `_changed()`, used as each page's `ValueKey` so the page rebuilds and its `FutureBuilder` re-queries. There is no state-management package and no router; pass `onChanged` down and call it after any write.
 

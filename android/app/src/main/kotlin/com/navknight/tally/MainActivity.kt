@@ -21,7 +21,7 @@ class MainActivity : FlutterActivity() {
                 "requestSmsPermission" -> if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED) result.success(true) else { smsResult = result; ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS), 41) }
                 "takePendingSms" -> { val p = getSharedPreferences("tally_sms", MODE_PRIVATE); val raw = p.getString("pending", "") ?: ""; p.edit().remove("pending").apply(); result.success(decodeMessages(raw)) }
                 "readHistoricSms" -> result.success(readHistoricSms())
-                "pickCsv" -> { fileResult = result; startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "text/*" }, 42) }
+                "pickStatement" -> { fileResult = result; startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*"; putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("text/csv", "text/comma-separated-values", "text/plain", "application/pdf")) }, 42) }
                 else -> result.notImplemented()
             }
         }
@@ -42,5 +42,20 @@ class MainActivity : FlutterActivity() {
         return messages
     }
     override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grants: IntArray) { super.onRequestPermissionsResult(code, permissions, grants); if (code == 41) { smsResult?.success(grants.isNotEmpty() && grants[0] == PackageManager.PERMISSION_GRANTED); smsResult = null } }
-    override fun onActivityResult(code: Int, resultCode: Int, data: Intent?) { super.onActivityResult(code, resultCode, data); if (code == 42) { val text = if (resultCode == Activity.RESULT_OK) data?.data?.let { contentResolver.openInputStream(it)?.bufferedReader()?.use { r -> r.readText() } } else null; fileResult?.success(text); fileResult = null } }
+    override fun onActivityResult(code: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(code, resultCode, data)
+        if (code == 42) {
+            val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
+            val picked = uri?.let { u ->
+                val bytes = contentResolver.openInputStream(u)?.use { it.readBytes() }
+                val name = contentResolver.query(u, null, null, null, null)?.use { c ->
+                    val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (idx >= 0 && c.moveToFirst()) c.getString(idx) else null
+                } ?: u.lastPathSegment ?: "statement"
+                bytes?.let { mapOf("name" to name, "bytes" to it) }
+            }
+            fileResult?.success(picked)
+            fileResult = null
+        }
+    }
 }

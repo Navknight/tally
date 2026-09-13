@@ -1,13 +1,17 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 
 import 'app/theme.dart';
 import 'core/money.dart';
 import 'data/tally_database.dart';
+import 'models/account.dart';
+import 'models/categories.dart';
 import 'models/transaction.dart';
 import 'platform/android_bridge.dart';
 import 'services/sms_ingestion.dart';
+import 'services/statement_import.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -49,6 +53,7 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
 
   Future<void> _load() async {
     final done = await TallyDatabase.instance.setting('onboarded') == 'true';
+    await TallyDatabase.instance.ensureCategorySeed();
     if (mounted) setState(() => _ready = done);
   }
 
@@ -59,9 +64,10 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
   }
 
   Future<void> _importPendingSms() async {
-    final messages = await AndroidBridge.pendingSms();
-    await ingestSms(messages);
-    if (messages.isNotEmpty && mounted) setState(() {});
+    final report = await ingestPendingSms();
+    if (report.considered == 0) return;
+    await recategorizeReviewQueue();
+    if (mounted) setState(() {});
   }
 
   @override
@@ -82,11 +88,15 @@ class Onboarding extends StatefulWidget {
 }
 
 class _OnboardingState extends State<Onboarding> {
+  final _name = TextEditingController(text: 'Main account');
+  final _last4 = TextEditingController();
   final _amount = TextEditingController();
   final _currency = TextEditingController(text: '₹');
   bool _saving = false;
   @override
   void dispose() {
+    _name.dispose();
+    _last4.dispose();
     _amount.dispose();
     _currency.dispose();
     super.dispose();
@@ -99,8 +109,15 @@ class _OnboardingState extends State<Onboarding> {
       'currency',
       _currency.text.trim().isEmpty ? '₹' : _currency.text.trim(),
     );
-    await TallyDatabase.instance.setSetting('opening_balance', '$opening');
     await TallyDatabase.instance.setSetting('monthly_budget', '0');
+    await TallyDatabase.instance.addAccount(
+      Account(
+        id: null,
+        name: _name.text.trim().isEmpty ? 'Main account' : _name.text.trim(),
+        last4: _last4.text.trim(),
+        openingBalanceMinor: opening,
+      ),
+    );
     await TallyDatabase.instance.setSetting('onboarded', 'true');
     widget.onComplete();
   }
@@ -108,12 +125,12 @@ class _OnboardingState extends State<Onboarding> {
   @override
   Widget build(BuildContext context) => Scaffold(
     body: SafeArea(
-      child: Padding(
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(28),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Spacer(),
+            const SizedBox(height: 24),
             Icon(
               Icons.account_balance_wallet_rounded,
               size: 48,
@@ -127,10 +144,26 @@ class _OnboardingState extends State<Onboarding> {
             ),
             const SizedBox(height: 10),
             Text(
-              'Everything stays on this device. Start with the balance in your main account.',
+              'Everything stays on this device. Start with your main account.',
               style: Theme.of(context).textTheme.bodyLarge,
             ),
             const SizedBox(height: 30),
+            TextField(
+              controller: _name,
+              decoration: const InputDecoration(labelText: 'Account name'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: _last4,
+              maxLength: 4,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Last 4 digits (optional)',
+                hintText: 'Helps match bank SMS to this account',
+                counterText: '',
+              ),
+            ),
+            const SizedBox(height: 10),
             Row(
               children: [
                 SizedBox(
@@ -157,10 +190,10 @@ class _OnboardingState extends State<Onboarding> {
             ),
             const SizedBox(height: 16),
             Text(
-              'You can import a CSV statement or connect SMS from Settings afterwards.',
+              'You can import a statement or connect SMS from Settings afterwards.',
               style: Theme.of(context).textTheme.bodySmall,
             ),
-            const Spacer(),
+            const SizedBox(height: 30),
             SizedBox(
               width: double.infinity,
               child: FilledButton(
@@ -194,7 +227,7 @@ class _TallyShellState extends State<TallyShell> {
       HomeScreen(key: ValueKey(_refresh), onChanged: _changed),
       TransactionsScreen(key: ValueKey(_refresh), onChanged: _changed),
       BudgetScreen(key: ValueKey(_refresh), onChanged: _changed),
-      const SettingsScreen(),
+      SettingsScreen(key: ValueKey(_refresh), onChanged: _changed),
     ];
     return Scaffold(
       body: pages[_tab],
@@ -241,18 +274,20 @@ class HomeScreen extends StatelessWidget {
   Widget build(BuildContext context) => FutureBuilder<List<Object?>>(
     future: Future.wait([
       TallyDatabase.instance.transactions(),
-      TallyDatabase.instance.setting('opening_balance'),
-      TallyDatabase.instance.setting('currency'),
+      TallyDatabase.instance.accounts(),
+      TallyDatabase.instance.currency(),
       TallyDatabase.instance.setting('monthly_budget'),
+      TallyDatabase.instance.reviewQueue(),
     ]),
     builder: (context, snapshot) {
       if (!snapshot.hasData)
         return const Scaffold(body: Center(child: CircularProgressIndicator()));
       final values = snapshot.data!;
       final tx = values[0] as List<TallyTransaction>;
-      final opening = int.tryParse(values[1] as String? ?? '0') ?? 0;
-      final symbol = values[2] as String? ?? '₹';
+      final accounts = values[1] as List<Account>;
+      final symbol = values[2] as String;
       final budget = int.tryParse(values[3] as String? ?? '0') ?? 0;
+      final review = values[4] as List<TallyTransaction>;
       final now = DateTime.now();
       final month = tx
           .where(
@@ -264,16 +299,7 @@ class HomeScreen extends StatelessWidget {
       final spent = month
           .where((t) => t.kind == TransactionKind.expense)
           .fold<int>(0, (sum, t) => sum + t.amountMinor);
-      final balance =
-          opening +
-          tx.fold<int>(
-            0,
-            (sum, t) =>
-                sum +
-                (t.kind == TransactionKind.income
-                    ? t.amountMinor
-                    : -t.amountMinor),
-          );
+      final balance = totalBalance(accounts, tx);
       return Scaffold(
         appBar: AppBar(title: const Text('Tally')),
         body: ListView(
@@ -284,6 +310,29 @@ class HomeScreen extends StatelessWidget {
               money(balance, symbol),
               style: Theme.of(context).textTheme.displayMedium,
             ),
+            if (accounts.length > 1) ...[
+              const SizedBox(height: 12),
+              ...accounts.map(
+                (a) => Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 2),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        a.name,
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                      Text(
+                        money(accountBalance(a, tx), symbol),
+                        style: Theme.of(
+                          context,
+                        ).textTheme.bodySmall?.copyWith(fontFeatures: tabular),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
             const SizedBox(height: 24),
             Card(
               child: Padding(
@@ -321,6 +370,25 @@ class HomeScreen extends StatelessWidget {
                 ),
               ),
             ),
+            if (review.isNotEmpty) ...[
+              const SizedBox(height: 28),
+              Text(
+                'Needs review',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 4),
+              Text(
+                'Tally wasn\'t sure how to label these.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              ...review.map(
+                (t) => TransactionTile(
+                  transaction: t,
+                  symbol: symbol,
+                  onTap: () => showCategoryPicker(context, t, onChanged),
+                ),
+              ),
+            ],
             const SizedBox(height: 28),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -334,7 +402,13 @@ class HomeScreen extends StatelessWidget {
             ),
             ...tx
                 .take(6)
-                .map((t) => TransactionTile(transaction: t, symbol: symbol)),
+                .map(
+                  (t) => TransactionTile(
+                    transaction: t,
+                    symbol: symbol,
+                    onTap: () => showCategoryPicker(context, t, onChanged),
+                  ),
+                ),
           ],
         ),
       );
@@ -350,13 +424,13 @@ class TransactionsScreen extends StatelessWidget {
   Widget build(BuildContext context) => FutureBuilder<List<Object?>>(
     future: Future.wait([
       TallyDatabase.instance.transactions(),
-      TallyDatabase.instance.setting('currency'),
+      TallyDatabase.instance.currency(),
     ]),
     builder: (context, snapshot) {
       if (!snapshot.hasData)
         return const Scaffold(body: Center(child: CircularProgressIndicator()));
       final transactions = snapshot.data![0] as List<TallyTransaction>;
-      final symbol = snapshot.data![1] as String? ?? '₹';
+      final symbol = snapshot.data![1] as String;
       return Scaffold(
         appBar: AppBar(title: const Text('Activity')),
         body: transactions.isEmpty
@@ -382,6 +456,8 @@ class TransactionsScreen extends StatelessWidget {
                     child: TransactionTile(
                       transaction: transaction,
                       symbol: symbol,
+                      onTap: () =>
+                          showCategoryPicker(context, transaction, onChanged),
                     ),
                   );
                 },
@@ -396,14 +472,17 @@ class TransactionTile extends StatelessWidget {
     super.key,
     required this.transaction,
     required this.symbol,
+    this.onTap,
   });
   final TallyTransaction transaction;
   final String symbol;
+  final VoidCallback? onTap;
   @override
   Widget build(BuildContext context) {
     final positive = transaction.kind == TransactionKind.income;
     final scheme = Theme.of(context).colorScheme;
     return ListTile(
+      onTap: onTap,
       contentPadding: EdgeInsets.zero,
       leading: CircleAvatar(
         backgroundColor: scheme.surfaceContainerHigh,
@@ -412,7 +491,8 @@ class TransactionTile extends StatelessWidget {
       ),
       title: Text(transaction.merchant),
       subtitle: Text(
-        '${transaction.category} · ${transaction.occurredAt.day}/${transaction.occurredAt.month}',
+        '${transaction.category} · ${transaction.occurredAt.day}/${transaction.occurredAt.month}'
+        '${transaction.needsReview ? ' · tap to label' : ''}',
       ),
       trailing: Text(
         '${positive ? '+' : '-'}${money(transaction.amountMinor, symbol)}',
@@ -424,6 +504,63 @@ class TransactionTile extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Bottom sheet to set or correct a transaction's category. Calling
+/// [confirmCategory] both saves the choice and sweeps other unlabelled rows
+/// from the same merchant, so the snackbar reports how many were caught up.
+void showCategoryPicker(
+  BuildContext context,
+  TallyTransaction transaction,
+  VoidCallback onSaved,
+) {
+  showModalBottomSheet(
+    context: context,
+    builder: (sheetContext) => SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Category for ${transaction.merchant}',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ),
+          ),
+          ...kCategories.map(
+            (category) => ListTile(
+              title: Text(category),
+              trailing: category == transaction.category
+                  ? const Icon(Icons.check)
+                  : null,
+              onTap: () async {
+                final appliedToOthers = await confirmCategory(
+                  transaction,
+                  category,
+                );
+                if (sheetContext.mounted) Navigator.pop(sheetContext);
+                onSaved();
+                if (context.mounted)
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(
+                        appliedToOthers > 0
+                            ? 'Saved. Applied to $appliedToOthers more from ${transaction.merchant}'
+                            : 'Saved',
+                      ),
+                    ),
+                  );
+              },
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    ),
+  );
 }
 
 class BudgetScreen extends StatefulWidget {
@@ -452,7 +589,7 @@ class _BudgetScreenState extends State<BudgetScreen> {
                     0) /
                 100)
             .toStringAsFixed(2);
-    symbol = await TallyDatabase.instance.setting('currency') ?? '₹';
+    symbol = await TallyDatabase.instance.currency();
     if (mounted) setState(() => loading = false);
   }
 
@@ -514,91 +651,262 @@ class _BudgetScreenState extends State<BudgetScreen> {
 }
 
 class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key});
+  const SettingsScreen({super.key, required this.onChanged});
+  final VoidCallback onChanged;
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
 class _SettingsScreenState extends State<SettingsScreen> {
-  String _status = '';
-  Future<void> _sms() async {
+  String _smsStatus = '';
+
+  Future<void> _scanSms() async {
     final granted = await AndroidBridge.requestSmsPermission();
-    final imported = granted
-        ? await ingestSms(await AndroidBridge.historicSms())
-        : 0;
-    if (mounted)
-      setState(
-        () => _status = granted
-            ? 'SMS enabled. Imported $imported historic transactions locally.'
-            : 'SMS access was not granted.',
-      );
+    if (!granted) {
+      setState(() => _smsStatus = 'SMS access was not granted.');
+      return;
+    }
+    final report = await ingestHistoricSms();
+    await recategorizeReviewQueue();
+    widget.onChanged();
+    if (!mounted) return;
+    setState(() => _smsStatus = _describeIngest(report));
+  }
+
+  Future<void> _importStatement() async {
+    final file = await AndroidBridge.pickStatementFile();
+    if (file == null) {
+      if (mounted) _showPasteCsvSheet(context);
+      return;
+    }
+    final rows = file.name.toLowerCase().endsWith('.pdf')
+        ? parsePdfStatement(file.bytes)
+        : parseCsvStatement(utf8.decode(file.bytes, allowMalformed: true));
+    await _importRows(rows, file.name);
+  }
+
+  Future<void> _importRows(List<StatementRow> rows, String source) async {
+    if (rows.isEmpty) {
+      _snack('No transactions found in $source.');
+      return;
+    }
+    final account = await _chooseAccount();
+    if (account == null) return;
+    final inserted = await ingestStatementRows(
+      rows: rows,
+      accountId: account.id!,
+      source: source.toLowerCase().endsWith('.pdf') ? 'pdf' : 'csv',
+    );
+    widget.onChanged();
+    _snack('$inserted transactions imported to ${account.name}');
+  }
+
+  /// Skips the picker entirely when there is only one account to target.
+  Future<Account?> _chooseAccount() async {
+    final accounts = await TallyDatabase.instance.accounts();
+    if (accounts.isEmpty) {
+      _snack('Add an account first.');
+      return null;
+    }
+    if (accounts.length == 1) return accounts.single;
+    if (!mounted) return null;
+    return showModalBottomSheet<Account>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: accounts
+              .map(
+                (a) => ListTile(
+                  title: Text(a.name),
+                  subtitle: a.last4.isEmpty ? null : Text('···· ${a.last4}'),
+                  onTap: () => Navigator.pop(sheetContext, a),
+                ),
+              )
+              .toList(),
+        ),
+      ),
+    );
+  }
+
+  void _snack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: const Text('Settings')),
-    body: ListView(
-      padding: const EdgeInsets.all(12),
-      children: [
-        const ListTile(
-          title: Text('Privacy'),
-          subtitle: Text('Your ledger stays on this device.'),
-        ),
-        ListTile(
-          leading: const Icon(Icons.sms_outlined),
-          title: const Text('Bank SMS'),
-          subtitle: Text(
-            _status.isEmpty ? 'Optional local transaction detection' : _status,
-          ),
-          trailing: FilledButton(onPressed: _sms, child: const Text('Enable')),
-        ),
-        ListTile(
-          leading: const Icon(Icons.file_upload_outlined),
-          title: const Text('Import statement'),
-          subtitle: const Text(
-            'Choose or paste a CSV: date, merchant, signed amount',
-          ),
-          onTap: () => _pickCsv(context),
-        ),
-      ],
+    body: FutureBuilder<List<Account>>(
+      future: TallyDatabase.instance.accounts(),
+      builder: (context, snapshot) {
+        final accounts = snapshot.data ?? const [];
+        return ListView(
+          padding: const EdgeInsets.all(12),
+          children: [
+            const ListTile(
+              title: Text('Privacy'),
+              subtitle: Text('Your ledger stays on this device.'),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text('Accounts', style: Theme.of(context).textTheme.titleMedium),
+                  TextButton(
+                    onPressed: () => _showAccountSheet(context),
+                    child: const Text('Add'),
+                  ),
+                ],
+              ),
+            ),
+            ...accounts.map(
+              (a) => ListTile(
+                leading: const Icon(Icons.account_balance_outlined),
+                title: Text(a.name),
+                subtitle: Text(
+                  a.last4.isEmpty ? 'No linked digits' : '···· ${a.last4}',
+                ),
+                trailing: IconButton(
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () => _confirmDeleteAccount(context, a),
+                ),
+                onTap: () => _showAccountSheet(context, existing: a),
+              ),
+            ),
+            const Divider(height: 32),
+            ListTile(
+              leading: const Icon(Icons.sms_outlined),
+              title: const Text('Bank SMS'),
+              subtitle: Text(
+                _smsStatus.isEmpty
+                    ? 'Scan your inbox for past transactions'
+                    : _smsStatus,
+              ),
+              trailing: FilledButton(
+                onPressed: _scanSms,
+                child: const Text('Scan SMS inbox'),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.file_upload_outlined),
+              title: const Text('Import statement'),
+              subtitle: const Text('Choose a CSV or PDF, or paste rows'),
+              onTap: _importStatement,
+            ),
+          ],
+        );
+      },
     ),
   );
-  Future<void> _pickCsv(BuildContext context) async {
-    final text = await AndroidBridge.pickCsv();
-    if (text == null) {
-      if (context.mounted) _showCsv(context);
-      return;
-    }
-    await _importRows(text, context);
-  }
 
-  Future<void> _importRows(String text, BuildContext context) async {
-    var count = 0;
-    for (final row in text.split('\n')) {
-      final cells = row.split(',');
-      if (cells.length < 3) continue;
-      final amount = parseMoney(cells[2]) ?? 0;
-      final date = DateTime.tryParse(cells[0].trim()) ?? DateTime.now();
-      await TallyDatabase.instance.add(
-        TallyTransaction(
-          id: null,
-          amountMinor: amount.abs(),
-          kind: amount >= 0 ? TransactionKind.income : TransactionKind.expense,
-          occurredAt: date,
-          merchant: cells[1].trim(),
-          category: 'Imported',
-          source: 'csv',
+  Future<void> _confirmDeleteAccount(BuildContext context, Account a) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Delete account?'),
+        content: Text(
+          'Transactions from ${a.name} stay in your ledger without an account.',
         ),
-      );
-      count++;
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await TallyDatabase.instance.deleteAccount(a.id!);
+      widget.onChanged();
+      setState(() {});
     }
-    if (context.mounted)
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('$count transactions imported')));
   }
 
-  void _showCsv(BuildContext context) {
+  void _showAccountSheet(BuildContext context, {Account? existing}) {
+    final name = TextEditingController(text: existing?.name ?? '');
+    final last4 = TextEditingController(text: existing?.last4 ?? '');
+    final opening = TextEditingController(
+      text: existing == null
+          ? ''
+          : (existing.openingBalanceMinor / 100).toStringAsFixed(2),
+    );
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => Padding(
+        padding: EdgeInsets.fromLTRB(
+          20,
+          20,
+          20,
+          MediaQuery.of(sheetContext).viewInsets.bottom + 20,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              existing == null ? 'Add account' : 'Edit account',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: name,
+              autofocus: true,
+              decoration: const InputDecoration(labelText: 'Account name'),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: last4,
+              maxLength: 4,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Last 4 digits (optional)',
+                counterText: '',
+              ),
+            ),
+            const SizedBox(height: 10),
+            TextField(
+              controller: opening,
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              decoration: const InputDecoration(labelText: 'Opening balance'),
+            ),
+            const SizedBox(height: 16),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton(
+                onPressed: () async {
+                  if (name.text.trim().isEmpty) return;
+                  final account = Account(
+                    id: existing?.id,
+                    name: name.text.trim(),
+                    last4: last4.text.trim(),
+                    openingBalanceMinor: parseMoney(opening.text) ?? 0,
+                    reportedBalanceMinor: existing?.reportedBalanceMinor,
+                    reportedAt: existing?.reportedAt,
+                  );
+                  if (existing == null)
+                    await TallyDatabase.instance.addAccount(account);
+                  else
+                    await TallyDatabase.instance.updateAccount(account);
+                  if (sheetContext.mounted) Navigator.pop(sheetContext);
+                  widget.onChanged();
+                  setState(() {});
+                },
+                child: const Text('Save account'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showPasteCsvSheet(BuildContext context) {
     final text = TextEditingController();
     showModalBottomSheet(
       context: context,
@@ -614,13 +922,15 @@ class _SettingsScreenState extends State<SettingsScreen> {
           mainAxisSize: MainAxisSize.min,
           children: [
             const Text(
-              'Import CSV',
+              'Paste CSV',
               style: TextStyle(
                 fontSize: 22,
                 fontWeight: FontWeight.w700,
                 letterSpacing: -0.3,
               ),
             ),
+            const SizedBox(height: 4),
+            const Text('date, merchant, signed amount'),
             const SizedBox(height: 12),
             TextField(
               controller: text,
@@ -633,35 +943,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
             const SizedBox(height: 12),
             FilledButton(
               onPressed: () async {
-                var count = 0;
-                for (final row in text.text.split('\n')) {
-                  final cells = row.split(',');
-                  if (cells.length < 3) continue;
-                  final amount = parseMoney(cells[2]) ?? 0;
-                  final date =
-                      DateTime.tryParse(cells[0].trim()) ?? DateTime.now();
-                  await TallyDatabase.instance.add(
-                    TallyTransaction(
-                      id: null,
-                      amountMinor: amount.abs(),
-                      kind: amount >= 0
-                          ? TransactionKind.income
-                          : TransactionKind.expense,
-                      occurredAt: date,
-                      merchant: cells[1].trim(),
-                      category: 'Imported',
-                      source: 'csv',
-                    ),
-                  );
-                  count++;
-                }
+                final rows = parseCsvStatement(text.text);
                 if (sheetContext.mounted) Navigator.pop(sheetContext);
-                if (mounted)
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(content: Text('$count transactions imported')),
-                  );
+                await _importRows(rows, 'pasted.csv');
               },
-              child: const Text('Import locally'),
+              child: const Text('Import'),
             ),
           ],
         ),
@@ -670,11 +956,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 }
 
+String _describeIngest(IngestReport report) =>
+    '${report.inserted} added, ${report.duplicates} already saved, ${report.ignored} skipped';
+
 void showTransactionSheet(BuildContext context, VoidCallback onSaved) {
   final merchant = TextEditingController();
   final amount = TextEditingController();
   var kind = TransactionKind.expense;
-  var category = 'General';
+  var category = 'Other';
   showModalBottomSheet(
     context: context,
     isScrollControlled: true,
@@ -728,15 +1017,9 @@ void showTransactionSheet(BuildContext context, VoidCallback onSaved) {
             DropdownButtonFormField<String>(
               value: category,
               decoration: const InputDecoration(labelText: 'Category'),
-              items: const [
-                'General',
-                'Food',
-                'Transport',
-                'Shopping',
-                'Bills',
-                'Health',
-                'Income',
-              ].map((v) => DropdownMenuItem(value: v, child: Text(v))).toList(),
+              items: kCategories
+                  .map((v) => DropdownMenuItem(value: v, child: Text(v)))
+                  .toList(),
               onChanged: (v) => category = v ?? category,
             ),
             const SizedBox(height: 16),

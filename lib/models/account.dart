@@ -1,3 +1,5 @@
+import 'transaction.dart';
+
 /// A bank account, card or wallet the ledger tracks.
 ///
 /// [last4] is how an incoming SMS is matched back to an account: bank messages
@@ -50,4 +52,25 @@ class Account {
         ? null
         : DateTime.fromMillisecondsSinceEpoch(map['reported_at'] as int),
   );
+}
+
+/// Opening balance plus every transaction booked against [account].
+int accountBalance(Account account, Iterable<TallyTransaction> transactions) =>
+    account.openingBalanceMinor +
+    transactions
+        .where((t) => t.accountId == account.id)
+        .fold<int>(0, (sum, t) => sum + t.signedMinor);
+
+/// Balance across every tracked account, plus any transaction that never
+/// matched an account (so nothing silently drops off the total).
+int totalBalance(List<Account> accounts, List<TallyTransaction> transactions) {
+  final trackedIds = accounts.map((a) => a.id).toSet();
+  final tracked = accounts.fold<int>(
+    0,
+    (sum, a) => sum + accountBalance(a, transactions),
+  );
+  final untracked = transactions
+      .where((t) => !trackedIds.contains(t.accountId))
+      .fold<int>(0, (sum, t) => sum + t.signedMinor);
+  return tracked + untracked;
 }

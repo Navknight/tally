@@ -1,7 +1,9 @@
 import 'dart:typed_data';
 
+import '../core/hash.dart';
 import '../core/money.dart';
 import '../core/pdf_text.dart';
+import '../models/transaction.dart';
 
 /// One transaction row recovered from a bank statement (CSV or PDF).
 class StatementRow {
@@ -340,6 +342,35 @@ StatementRow? _parsePdfLine(String line) {
     balanceMinor: balance,
   );
 }
+
+/// Turns one parsed statement row into a ledger row against [accountId].
+/// Pure, so the mapping can be tested without a database.
+TallyTransaction statementRowToTransaction(
+  StatementRow row, {
+  required int accountId,
+  required String source,
+  required String category,
+  bool needsReview = false,
+}) => TallyTransaction(
+  id: null,
+  amountMinor: row.amountMinor,
+  kind: row.isCredit ? TransactionKind.income : TransactionKind.expense,
+  occurredAt: row.date,
+  merchant: row.merchant,
+  category: category,
+  source: source,
+  // Re-importing the same statement must not duplicate rows. Two identical
+  // same-day rows without a running balance collapse into one; rare enough.
+  fingerprint: stableHash(
+    'stmt|$accountId|${row.date.year}-${row.date.month}-${row.date.day}|'
+    '${row.amountMinor}|${row.isCredit}|${row.merchant}|${row.balanceMinor}',
+  ),
+  accountId: accountId,
+  reference: row.reference,
+  balanceAfterMinor: row.balanceMinor,
+  categorySource: CategorySource.imported,
+  needsReview: needsReview,
+);
 
 /// Extracts text from a PDF statement and parses its transaction lines.
 /// Returns an empty list when no text could be recovered.
