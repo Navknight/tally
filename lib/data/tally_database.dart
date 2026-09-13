@@ -161,8 +161,9 @@ class TallyDatabase implements CategoryStore {
       'reported_balance_minor': balanceMinor,
       'reported_at': at.millisecondsSinceEpoch,
     },
-    where: 'id = ?',
-    whereArgs: [accountId],
+    // Historic scans arrive out of order; only a newer balance may replace one.
+    where: 'id = ? AND (reported_at IS NULL OR reported_at < ?)',
+    whereArgs: [accountId, at.millisecondsSinceEpoch],
   );
 
   // ------------------------------------------------------------ transactions
@@ -193,12 +194,26 @@ class TallyDatabase implements CategoryStore {
   /// Inserts unless an identical fingerprint is already stored. Returns whether
   /// a row was actually written.
   Future<bool> add(TallyTransaction transaction) async =>
+      !await _hasReference(transaction) &&
       await (await _db).insert(
         'transactions',
         transaction.toMap()..remove('id'),
         conflictAlgorithm: ConflictAlgorithm.ignore,
       ) >
       0;
+
+  /// The bank and a UPI app often both text about one payment, and statements
+  /// repeat it again; a shared reference number with the same amount is the
+  /// same money.
+  Future<bool> _hasReference(TallyTransaction t) async =>
+      (t.reference ?? '').isNotEmpty &&
+      (await (await _db).query(
+        'transactions',
+        columns: ['id'],
+        where: 'reference = ? AND amount_minor = ?',
+        whereArgs: [t.reference, t.amountMinor],
+        limit: 1,
+      )).isNotEmpty;
 
   Future<int> addAll(Iterable<TallyTransaction> rows) async {
     var inserted = 0;

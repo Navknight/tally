@@ -116,6 +116,8 @@ class _OnboardingState extends State<Onboarding> {
         name: _name.text.trim().isEmpty ? 'Main account' : _name.text.trim(),
         last4: _last4.text.trim(),
         openingBalanceMinor: opening,
+        reportedBalanceMinor: opening,
+        reportedAt: DateTime.now(),
       ),
     );
     await TallyDatabase.instance.setSetting('onboarded', 'true');
@@ -273,7 +275,8 @@ class HomeScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) => FutureBuilder<List<Object?>>(
     future: Future.wait([
-      TallyDatabase.instance.transactions(),
+      // ponytail: loads every row to sum balances; move to SQL SUM if it drags.
+      TallyDatabase.instance.transactions(limit: -1),
       TallyDatabase.instance.accounts(),
       TallyDatabase.instance.currency(),
       TallyDatabase.instance.setting('monthly_budget'),
@@ -834,8 +837,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
     final opening = TextEditingController(
       text: existing == null
           ? ''
-          : (existing.openingBalanceMinor / 100).toStringAsFixed(2),
+          : ((existing.reportedBalanceMinor ?? existing.openingBalanceMinor) /
+                    100)
+                .toStringAsFixed(2),
     );
+    final initialBalance = opening.text;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -873,7 +879,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
             TextField(
               controller: opening,
               keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(labelText: 'Opening balance'),
+              decoration: const InputDecoration(
+                labelText: 'Balance',
+                helperText: 'What your bank shows right now',
+              ),
             ),
             const SizedBox(height: 16),
             SizedBox(
@@ -881,13 +890,19 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: FilledButton(
                 onPressed: () async {
                   if (name.text.trim().isEmpty) return;
+                  final typed = parseMoney(opening.text) ?? 0;
+                  // A changed balance means "this is what I have now".
+                  final reanchor =
+                      existing == null || opening.text != initialBalance;
                   final account = Account(
                     id: existing?.id,
                     name: name.text.trim(),
                     last4: last4.text.trim(),
-                    openingBalanceMinor: parseMoney(opening.text) ?? 0,
-                    reportedBalanceMinor: existing?.reportedBalanceMinor,
-                    reportedAt: existing?.reportedAt,
+                    openingBalanceMinor: existing?.openingBalanceMinor ?? typed,
+                    reportedBalanceMinor: reanchor
+                        ? typed
+                        : existing.reportedBalanceMinor,
+                    reportedAt: reanchor ? DateTime.now() : existing.reportedAt,
                   );
                   if (existing == null)
                     await TallyDatabase.instance.addAccount(account);

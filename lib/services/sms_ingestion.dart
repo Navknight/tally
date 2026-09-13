@@ -159,11 +159,17 @@ Future<CategoryGuess> _categorise(
 }
 
 Account? _match(List<Account> accounts, String? last4) {
-  if (last4 == null || last4.isEmpty) return null;
-  for (final account in accounts)
-    if (account.last4 == last4) return account;
-  // A single tracked account is unambiguous even when the digits don't line up
-  // (many users never enter them), so attribute rather than orphan the row.
+  if (last4 != null && last4.isNotEmpty) {
+    for (final account in accounts)
+      if (account.last4.isNotEmpty &&
+          (last4.endsWith(account.last4) || account.last4.endsWith(last4)))
+        return account;
+    // Digits that match nothing are usually a credit card or another bank.
+    // Only a lone account with no digits entered can safely claim them.
+    return accounts.length == 1 && accounts.single.last4.isEmpty
+        ? accounts.single
+        : null;
+  }
   return accounts.length == 1 ? accounts.single : null;
 }
 
@@ -238,11 +244,8 @@ Future<int> ingestStatementRows({
 /// unlabelled row from the same merchant so the question is asked once.
 Future<int> confirmCategory(TallyTransaction row, String category) async {
   final db = TallyDatabase.instance;
-  await Categorizer(db).learn(
-    merchant: row.merchant,
-    body: row.note,
-    category: category,
-  );
+  await Categorizer(db)
+      .learn(merchant: row.merchant, body: row.note, category: category);
   await db.updateTransaction(
     row.copyWith(
       category: category,

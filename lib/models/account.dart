@@ -55,22 +55,24 @@ class Account {
 }
 
 /// Opening balance plus every transaction booked against [account].
-int accountBalance(Account account, Iterable<TallyTransaction> transactions) =>
-    account.openingBalanceMinor +
-    transactions
-        .where((t) => t.accountId == account.id)
-        .fold<int>(0, (sum, t) => sum + t.signedMinor);
-
-/// Balance across every tracked account, plus any transaction that never
-/// matched an account (so nothing silently drops off the total).
-int totalBalance(List<Account> accounts, List<TallyTransaction> transactions) {
-  final trackedIds = accounts.map((a) => a.id).toSet();
-  final tracked = accounts.fold<int>(
-    0,
-    (sum, a) => sum + accountBalance(a, transactions),
-  );
-  final untracked = transactions
-      .where((t) => !trackedIds.contains(t.accountId))
-      .fold<int>(0, (sum, t) => sum + t.signedMinor);
-  return tracked + untracked;
+/// The latest known balance plus everything after it. The anchor is the newest
+/// balance a bank SMS or statement reported, or the balance typed in when the
+/// account was set up; older transactions are already inside that number.
+int accountBalance(Account account, Iterable<TallyTransaction> transactions) {
+  final at = account.reportedAt;
+  return (at == null
+          ? account.openingBalanceMinor
+          : account.reportedBalanceMinor ?? account.openingBalanceMinor) +
+      transactions
+          .where(
+            (t) =>
+                t.accountId == account.id &&
+                (at == null || t.occurredAt.isAfter(at)),
+          )
+          .fold<int>(0, (sum, t) => sum + t.signedMinor);
 }
+
+/// Rows that matched no account (a credit card, someone else's bank) are
+/// listed but never move the balance.
+int totalBalance(List<Account> accounts, List<TallyTransaction> transactions) =>
+    accounts.fold<int>(0, (sum, a) => sum + accountBalance(a, transactions));
