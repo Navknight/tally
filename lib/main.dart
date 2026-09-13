@@ -1015,7 +1015,7 @@ void showTransactionSheet(BuildContext context, VoidCallback onSaved) {
             ),
             const SizedBox(height: 10),
             DropdownButtonFormField<String>(
-              value: category,
+              initialValue: category,
               decoration: const InputDecoration(labelText: 'Category'),
               items: kCategories
                   .map((v) => DropdownMenuItem(value: v, child: Text(v)))

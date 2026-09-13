@@ -57,7 +57,7 @@ Release builds sign with `android/key.properties` when present, else the debug k
 
 ## Conventions
 
-Three lints are disabled in `analysis_options.yaml` and the code relies on them: brace-less single-statement `if`s (`curly_braces_in_flow_control_structures`), `use_build_context_synchronously`, and `deprecated_member_use`. Match the surrounding expression-bodied style (`=>` members, `Future.wait` for parallel reads).
+Two lints are disabled in `analysis_options.yaml` and the code relies on them: brace-less single-statement `if`s (`curly_braces_in_flow_control_structures`) and `use_build_context_synchronously`. CI fails on any analyzer issue, infos included. Match the surrounding expression-bodied style (`=>` members, `Future.wait` for parallel reads).
 
 
 ## Reference apps
