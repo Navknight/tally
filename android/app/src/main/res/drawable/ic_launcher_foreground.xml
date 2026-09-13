@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Five tally marks, kept inside the 66dp safe zone so every mask shape and
+     the themed (monochrome) icon show them whole. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M38,36v36M48,36v36M58,36v36M68,36v36M30,66L76,42"
+        android:strokeWidth="6"
+        android:strokeColor="#FF000000"
+        android:strokeLineCap="round" />
+</vector>
