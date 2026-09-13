@@ -1,0 +1,46 @@
+package com.navknight.tally
+
+import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.provider.Telephony
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+
+class MainActivity : FlutterActivity() {
+    private var smsResult: MethodChannel.Result? = null
+    private var fileResult: MethodChannel.Result? = null
+    override fun configureFlutterEngine(engine: FlutterEngine) {
+        super.configureFlutterEngine(engine)
+        MethodChannel(engine.dartExecutor.binaryMessenger, "com.navknight.tally/platform").setMethodCallHandler { call, result ->
+            when (call.method) {
+                "requestSmsPermission" -> if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED) result.success(true) else { smsResult = result; ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS), 41) }
+                "takePendingSms" -> { val p = getSharedPreferences("tally_sms", MODE_PRIVATE); val raw = p.getString("pending", "") ?: ""; p.edit().remove("pending").apply(); result.success(decodeMessages(raw)) }
+                "readHistoricSms" -> result.success(readHistoricSms())
+                "pickCsv" -> { fileResult = result; startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "text/*" }, 42) }
+                else -> result.notImplemented()
+            }
+        }
+    }
+    private fun decodeMessages(raw: String): List<Map<String, Any>> = raw.split("\u0000").filter { it.isNotBlank() }.mapNotNull { row ->
+        val fields = row.split("\u0001", limit = 3)
+        if (fields.size == 3) mapOf("sender" to fields[0], "timestamp" to (fields[1].toLongOrNull() ?: 0L), "body" to fields[2]) else null
+    }
+    private fun readHistoricSms(): List<Map<String, Any>> {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return emptyList()
+        val messages = ArrayList<Map<String, Any>>()
+        contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI, arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE), null, null, "date DESC LIMIT 5000")?.use { cursor ->
+            val senderIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
+            val bodyIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.BODY)
+            val dateIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.DATE)
+            while (cursor.moveToNext()) messages.add(mapOf("sender" to (cursor.getString(senderIndex) ?: ""), "body" to (cursor.getString(bodyIndex) ?: ""), "timestamp" to cursor.getLong(dateIndex)))
+        }
+        return messages
+    }
+    override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grants: IntArray) { super.onRequestPermissionsResult(code, permissions, grants); if (code == 41) { smsResult?.success(grants.isNotEmpty() && grants[0] == PackageManager.PERMISSION_GRANTED); smsResult = null } }
+    override fun onActivityResult(code: Int, resultCode: Int, data: Intent?) { super.onActivityResult(code, resultCode, data); if (code == 42) { val text = if (resultCode == Activity.RESULT_OK) data?.data?.let { contentResolver.openInputStream(it)?.bufferedReader()?.use { r -> r.readText() } } else null; fileResult?.success(text); fileResult = null } }
+}
