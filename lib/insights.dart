@@ -5,6 +5,8 @@ import 'app/theme.dart';
 import 'core/budget_period.dart';
 import 'core/money.dart';
 import 'data/tally_database.dart';
+import 'main.dart' show TransactionTile;
+import 'models/transaction.dart';
 import 'models/categories.dart';
 
 /// Spending charts for the current budget period: category breakdown and a
@@ -25,6 +27,7 @@ class InsightsScreen extends StatelessWidget {
         db.dailySpend(period),
         db.currency(),
         db.setting('monthly_budget'),
+        db.budgetRows(period),
       ]);
     }(),
     builder: (context, snapshot) {
@@ -37,6 +40,7 @@ class InsightsScreen extends StatelessWidget {
       final symbol = values[3] as String;
       final budget = int.tryParse(values[4] as String? ?? '0') ?? 0;
       final total = byCategory.fold<int>(0, (sum, e) => sum + e.$2);
+      final counted = values[5] as List<TallyTransaction>;
 
       return Scaffold(
         appBar: AppBar(title: const Text('Insights')),
@@ -54,9 +58,16 @@ class InsightsScreen extends StatelessWidget {
             : ListView(
                 padding: const EdgeInsets.fromLTRB(20, 12, 20, 100),
                 children: [
-                  Text('By category', style: Theme.of(context).textTheme.titleLarge),
+                  Text(
+                    'By category',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
                   const SizedBox(height: 16),
-                  _CategoryDonut(byCategory: byCategory, total: total, symbol: symbol),
+                  _CategoryDonut(
+                    byCategory: byCategory,
+                    total: total,
+                    symbol: symbol,
+                  ),
                   const SizedBox(height: 12),
                   ...byCategory.map(
                     (e) => _CategoryLegendRow(
@@ -66,7 +77,10 @@ class InsightsScreen extends StatelessWidget {
                     ),
                   ),
                   const SizedBox(height: 28),
-                  Text('Daily spend', style: Theme.of(context).textTheme.titleLarge),
+                  Text(
+                    'Daily spend',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
                   const SizedBox(height: 4),
                   Text(
                     '${period.start.day}/${period.start.month} - '
@@ -83,6 +97,19 @@ class InsightsScreen extends StatelessWidget {
                       budgetMinor: budget,
                       symbol: symbol,
                     ),
+                  ),
+                  const SizedBox(height: 28),
+                  Text(
+                    'Counted in budget',
+                    style: Theme.of(context).textTheme.titleLarge,
+                  ),
+                  Text(
+                    '${counted.length} transactions',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                  const SizedBox(height: 8),
+                  ...counted.map(
+                    (t) => TransactionTile(transaction: t, symbol: symbol),
                   ),
                 ],
               ),
@@ -157,7 +184,10 @@ class _CategoryLegendRow extends StatelessWidget {
         Expanded(child: Text(category)),
         Text(
           money(amountMinor, symbol),
-          style: const TextStyle(fontWeight: FontWeight.w600, fontFeatures: tabular),
+          style: const TextStyle(
+            fontWeight: FontWeight.w600,
+            fontFeatures: tabular,
+          ),
         ),
       ],
     ),

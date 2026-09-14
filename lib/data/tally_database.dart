@@ -15,14 +15,13 @@ class TallyDatabase implements CategoryStore {
   static final instance = TallyDatabase._();
   Database? _database;
 
-  Future<Database> get _db async =>
-      _database ??= await openDatabase(
-        join(await getDatabasesPath(), 'tally.db'),
-        version: 4,
-        onCreate: (db, _) async {
-          await db.execute('''CREATE TABLE settings (
+  Future<Database> get _db async => _database ??= await openDatabase(
+    join(await getDatabasesPath(), 'tally.db'),
+    version: 4,
+    onCreate: (db, _) async {
+      await db.execute('''CREATE TABLE settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL)''');
-          await db.execute('''CREATE TABLE transactions (
+      await db.execute('''CREATE TABLE transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT, amount_minor INTEGER NOT NULL,
             kind TEXT NOT NULL, occurred_at INTEGER NOT NULL, merchant TEXT NOT NULL,
             category TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
@@ -32,52 +31,52 @@ class TallyDatabase implements CategoryStore {
             needs_review INTEGER NOT NULL DEFAULT 0,
             exclude_from_budget INTEGER NOT NULL DEFAULT 0,
             transfer_account_id INTEGER)''');
-          await db.execute(
-            'CREATE INDEX tx_date ON transactions(occurred_at DESC)',
-          );
-          await db.execute(
-            'CREATE UNIQUE INDEX tx_fingerprint ON transactions(fingerprint)',
-          );
-          await _createV3(db);
-        },
-        onUpgrade: (db, oldVersion, _) async {
-          if (oldVersion < 2) {
-            await db.execute(
-              'ALTER TABLE transactions ADD COLUMN fingerprint TEXT',
-            );
-            await db.execute(
-              'CREATE UNIQUE INDEX tx_fingerprint ON transactions(fingerprint)',
-            );
-          }
-          if (oldVersion < 3) {
-            for (final column in const [
-              'account_id INTEGER',
-              'reference TEXT',
-              'balance_after_minor INTEGER',
-              "category_source TEXT NOT NULL DEFAULT 'manual'",
-              'needs_review INTEGER NOT NULL DEFAULT 0',
-            ])
-              await db.execute('ALTER TABLE transactions ADD COLUMN $column');
-            await _createV3(db);
-            await _adoptLegacyOpeningBalance(db);
-          }
-          if (oldVersion < 4) {
-            for (final column in const [
-              'exclude_from_budget INTEGER NOT NULL DEFAULT 0',
-              'transfer_account_id INTEGER',
-            ])
-              await db.execute('ALTER TABLE transactions ADD COLUMN $column');
-            // A fresh-from-<3 upgrade already created accounts with these
-            // columns via _createV3 above; only a v3 install needs them added.
-            if (oldVersion >= 3)
-              for (final column in const [
-                'in_budget INTEGER NOT NULL DEFAULT 1',
-                'min_balance_minor INTEGER',
-              ])
-                await db.execute('ALTER TABLE accounts ADD COLUMN $column');
-          }
-        },
+      await db.execute(
+        'CREATE INDEX tx_date ON transactions(occurred_at DESC)',
       );
+      await db.execute(
+        'CREATE UNIQUE INDEX tx_fingerprint ON transactions(fingerprint)',
+      );
+      await _createV3(db);
+    },
+    onUpgrade: (db, oldVersion, _) async {
+      if (oldVersion < 2) {
+        await db.execute(
+          'ALTER TABLE transactions ADD COLUMN fingerprint TEXT',
+        );
+        await db.execute(
+          'CREATE UNIQUE INDEX tx_fingerprint ON transactions(fingerprint)',
+        );
+      }
+      if (oldVersion < 3) {
+        for (final column in const [
+          'account_id INTEGER',
+          'reference TEXT',
+          'balance_after_minor INTEGER',
+          "category_source TEXT NOT NULL DEFAULT 'manual'",
+          'needs_review INTEGER NOT NULL DEFAULT 0',
+        ])
+          await db.execute('ALTER TABLE transactions ADD COLUMN $column');
+        await _createV3(db);
+        await _adoptLegacyOpeningBalance(db);
+      }
+      if (oldVersion < 4) {
+        for (final column in const [
+          'exclude_from_budget INTEGER NOT NULL DEFAULT 0',
+          'transfer_account_id INTEGER',
+        ])
+          await db.execute('ALTER TABLE transactions ADD COLUMN $column');
+        // A fresh-from-<3 upgrade already created accounts with these
+        // columns via _createV3 above; only a v3 install needs them added.
+        if (oldVersion >= 3)
+          for (final column in const [
+            'in_budget INTEGER NOT NULL DEFAULT 1',
+            'min_balance_minor INTEGER',
+          ])
+            await db.execute('ALTER TABLE accounts ADD COLUMN $column');
+      }
+    },
+  );
 
   static Future<void> _createV3(Database db) async {
     await db.execute('''CREATE TABLE accounts (
@@ -205,25 +204,26 @@ class TallyDatabase implements CategoryStore {
       .then((rows) => rows.map(TallyTransaction.fromMap).toList());
 
   /// Rows whose category was a low-confidence guess, newest first.
-  Future<List<TallyTransaction>> reviewQueue({int limit = 50}) async => (await _db)
-      .query(
-        'transactions',
-        where: 'needs_review = 1',
-        orderBy: 'occurred_at DESC',
-        limit: limit,
-      )
-      .then((rows) => rows.map(TallyTransaction.fromMap).toList());
+  Future<List<TallyTransaction>> reviewQueue({int limit = 50}) async =>
+      (await _db)
+          .query(
+            'transactions',
+            where: 'needs_review = 1',
+            orderBy: 'occurred_at DESC',
+            limit: limit,
+          )
+          .then((rows) => rows.map(TallyTransaction.fromMap).toList());
 
   /// Inserts unless an identical fingerprint is already stored. Returns whether
   /// a row was actually written.
   Future<bool> add(TallyTransaction transaction) async =>
       !await _hasReference(transaction) &&
       await (await _db).insert(
-        'transactions',
-        transaction.toMap()..remove('id'),
-        conflictAlgorithm: ConflictAlgorithm.ignore,
-      ) >
-      0;
+            'transactions',
+            transaction.toMap()..remove('id'),
+            conflictAlgorithm: ConflictAlgorithm.ignore,
+          ) >
+          0;
 
   /// The bank and a UPI app often both text about one payment, and statements
   /// repeat it again; a shared reference number with the same amount on the
@@ -279,7 +279,11 @@ class TallyDatabase implements CategoryStore {
         where: 'id = ?',
         whereArgs: [match.debit.id],
       );
-      await db.delete('transactions', where: 'id = ?', whereArgs: [match.credit.id]);
+      await db.delete(
+        'transactions',
+        where: 'id = ?',
+        whereArgs: [match.credit.id],
+      );
     }
     return matches.length;
   }
@@ -287,11 +291,24 @@ class TallyDatabase implements CategoryStore {
   /// Total spend in [period] on accounts that count toward the budget,
   /// excluding flagged rows, transfers, and rows with no account. The
   /// filtering itself is [budgetSpent], a pure function tested without sqflite.
+  Future<List<TallyTransaction>> budgetRows(BudgetPeriod period) async =>
+      budgetTransactions(
+        await transactions(limit: -1),
+        await accounts(),
+        period,
+      ).toList();
+
   Future<int> spentInPeriod(BudgetPeriod period) async =>
       budgetSpent(await transactions(limit: -1), await accounts(), period);
 
   Future<void> delete(int id) async =>
       (await _db).delete('transactions', where: 'id = ?', whereArgs: [id]);
+
+  /// Removes every SMS-sourced transaction so the inbox can be re-read after
+  /// a parser fix, without touching manual or statement entries or learned
+  /// merchant rules.
+  Future<void> deleteSmsRows() async =>
+      (await _db).delete('transactions', where: "source = 'sms'");
 
   Future<void> updateTransaction(TallyTransaction transaction) async =>
       (await _db).update(
@@ -304,7 +321,10 @@ class TallyDatabase implements CategoryStore {
   /// Applies a confirmed category to every other row from the same merchant
   /// that the user has not already labelled by hand. This is what stops the
   /// user re-labelling a recurring merchant. Returns the number of rows moved.
-  Future<int> applyCategoryToMerchant(String merchantKey, String category) async {
+  Future<int> applyCategoryToMerchant(
+    String merchantKey,
+    String category,
+  ) async {
     final db = await _db;
     final rows = await db.query(
       'transactions',
@@ -346,13 +366,15 @@ class TallyDatabase implements CategoryStore {
       .then((rows) => rows.isEmpty ? null : rows.single['category'] as String);
 
   @override
-  Future<void> saveMerchantCategory(String merchantKey, String category) async =>
-      (await _db).rawInsert(
-        '''INSERT INTO merchant_rules (merchant_key, category, hits) VALUES (?, ?, 1)
+  Future<void> saveMerchantCategory(
+    String merchantKey,
+    String category,
+  ) async => (await _db).rawInsert(
+    '''INSERT INTO merchant_rules (merchant_key, category, hits) VALUES (?, ?, 1)
            ON CONFLICT(merchant_key) DO UPDATE SET category = excluded.category,
            hits = hits + 1''',
-        [merchantKey, category],
-      );
+    [merchantKey, category],
+  );
 
   @override
   Future<Map<String, int>> tokenCounts(String token) async => (await _db)

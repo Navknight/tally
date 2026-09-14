@@ -33,7 +33,9 @@ String transactionsCsv(List<TallyTransaction> rows, List<Account> accounts) {
         t.merchant,
         t.category,
         t.kind.name,
-        _majorUnits(t.kind == TransactionKind.income ? t.amountMinor : -t.amountMinor),
+        _majorUnits(
+          t.kind == TransactionKind.income ? t.amountMinor : -t.amountMinor,
+        ),
         counted ? 'yes' : 'no',
         names[t.transferAccountId] ?? '',
         t.note,

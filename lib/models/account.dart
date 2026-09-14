@@ -120,16 +120,25 @@ int budgetSpent(
   Iterable<TallyTransaction> transactions,
   Iterable<Account> accounts,
   BudgetPeriod period,
+) => budgetTransactions(
+  transactions,
+  accounts,
+  period,
+).fold<int>(0, (sum, t) => sum + t.amountMinor);
+
+/// The rows [budgetSpent] adds up, for listing them.
+Iterable<TallyTransaction> budgetTransactions(
+  Iterable<TallyTransaction> transactions,
+  Iterable<Account> accounts,
+  BudgetPeriod period,
 ) {
   final inBudget = {for (final a in accounts) a.id: a.inBudget};
-  return transactions
-      .where(
-        (t) =>
-            t.kind == TransactionKind.expense &&
-            !t.excludeFromBudget &&
-            t.accountId != null &&
-            (inBudget[t.accountId] ?? false) &&
-            period.contains(t.occurredAt),
-      )
-      .fold<int>(0, (sum, t) => sum + t.amountMinor);
+  return transactions.where(
+    (t) =>
+        t.kind == TransactionKind.expense &&
+        !t.excludeFromBudget &&
+        t.accountId != null &&
+        (inBudget[t.accountId] ?? false) &&
+        period.contains(t.occurredAt),
+  );
 }

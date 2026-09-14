@@ -65,12 +65,16 @@ abstract class BankParser {
       return SmsIgnored(messageClass);
 
     final amount = extractAmount(body);
+    // A zero-rupee figure is never a real movement (a wallet spend quoting
+    // its balance, a TDS notice); nothing downstream should book it.
+    if (amount == 0) return SmsIgnored(MessageClass.personal);
     final kind = extractKind(body);
     final balance = extractBalance(body);
     final last4 = extractLast4(body);
 
     if (amount == null || kind == null) {
-      if (balance != null) return SmsBalance(balanceMinor: balance, last4: last4, bank: bank);
+      if (balance != null)
+        return SmsBalance(balanceMinor: balance, last4: last4, bank: bank);
       return SmsIgnored(MessageClass.personal);
     }
 

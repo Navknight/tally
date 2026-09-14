@@ -230,7 +230,11 @@ class _TallyShellState extends State<TallyShell> {
   @override
   Widget build(BuildContext context) {
     final pages = [
-      HomeScreen(key: ValueKey(_refresh), onChanged: _changed),
+      HomeScreen(
+        key: ValueKey(_refresh),
+        onChanged: _changed,
+        onOpenInsights: () => setState(() => _tab = 3),
+      ),
       TransactionsScreen(key: ValueKey(_refresh), onChanged: _changed),
       BudgetScreen(key: ValueKey(_refresh), onChanged: _changed),
       InsightsScreen(key: ValueKey(_refresh), onChanged: _changed),
@@ -292,8 +296,13 @@ double sheetBottomInset(BuildContext context) =>
     MediaQuery.viewInsetsOf(context).bottom;
 
 class HomeScreen extends StatelessWidget {
-  const HomeScreen({super.key, required this.onChanged});
+  const HomeScreen({
+    super.key,
+    required this.onChanged,
+    required this.onOpenInsights,
+  });
   final VoidCallback onChanged;
+  final VoidCallback onOpenInsights;
   @override
   Widget build(BuildContext context) => FutureBuilder<List<Object?>>(
     future: () async {
@@ -345,7 +354,8 @@ class HomeScreen extends StatelessWidget {
               const SizedBox(height: 12),
               ...accounts.map((a) {
                 final accBalance = accountBalance(a, tx);
-                final low = a.minBalanceMinor != null &&
+                final low =
+                    a.minBalanceMinor != null &&
                     accBalance < a.minBalanceMinor!;
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 2),
@@ -378,7 +388,10 @@ class HomeScreen extends StatelessWidget {
                     padding: const EdgeInsets.all(14),
                     child: Row(
                       children: [
-                        Icon(Icons.warning_amber_rounded, color: scheme.onErrorContainer),
+                        Icon(
+                          Icons.warning_amber_rounded,
+                          color: scheme.onErrorContainer,
+                        ),
                         const SizedBox(width: 12),
                         Expanded(
                           child: Text(
@@ -395,38 +408,51 @@ class HomeScreen extends StatelessWidget {
             ],
             const SizedBox(height: 24),
             Card(
-              child: Padding(
-                padding: const EdgeInsets.all(20),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        const Text('This budget period'),
-                        Text(
-                          money(spent, symbol),
-                          style: const TextStyle(
-                            fontWeight: FontWeight.w700,
-                            fontFeatures: tabular,
+              clipBehavior: Clip.antiAlias,
+              child: InkWell(
+                onTap: onOpenInsights,
+                child: Padding(
+                  padding: const EdgeInsets.all(20),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          const Text('This budget period'),
+                          Text(
+                            money(spent, symbol),
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w700,
+                              fontFeatures: tabular,
+                            ),
                           ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      LinearProgressIndicator(
+                        value: budget > 0
+                            ? (spent / budget).clamp(0, 1).toDouble()
+                            : 0,
+                        color: spent > budget && budget > 0
+                            ? scheme.error
+                            : null,
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: spent > budget && budget > 0
+                              ? scheme.error
+                              : null,
                         ),
-                      ],
-                    ),
-                    const SizedBox(height: 12),
-                    LinearProgressIndicator(
-                      value: budget > 0
-                          ? (spent / budget).clamp(0, 1).toDouble()
-                          : 0,
-                    ),
-                    const SizedBox(height: 8),
-                    Text(
-                      style: Theme.of(context).textTheme.bodySmall,
-                      budget > 0
-                          ? '${money((budget - spent).clamp(0, budget), symbol)} left of ${money(budget, symbol)}'
-                          : 'Set a monthly limit in Budget',
-                    ),
-                  ],
+                        budget <= 0
+                            ? 'Set a monthly limit in Budget'
+                            : spent > budget
+                            ? '${money(spent - budget, symbol)} over ${money(budget, symbol)}'
+                            : '${money(budget - spent, symbol)} left of ${money(budget, symbol)}',
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -445,7 +471,8 @@ class HomeScreen extends StatelessWidget {
                 (t) => TransactionTile(
                   transaction: t,
                   symbol: symbol,
-                  onTap: () => showTransactionSheet(context, onChanged, existing: t),
+                  onTap: () =>
+                      showTransactionSheet(context, onChanged, existing: t),
                 ),
               ),
             ],
@@ -466,7 +493,8 @@ class HomeScreen extends StatelessWidget {
                   (t) => TransactionTile(
                     transaction: t,
                     symbol: symbol,
-                    onTap: () => showTransactionSheet(context, onChanged, existing: t),
+                    onTap: () =>
+                        showTransactionSheet(context, onChanged, existing: t),
                   ),
                 ),
           ],
@@ -628,9 +656,8 @@ class _BudgetScreenState extends State<BudgetScreen> {
             children: [
               Text(
                 'One number is enough.',
-                style: Theme.of(
-                  context,
-                ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
+                style: Theme.of(context).textTheme.headlineSmall
+                    ?.copyWith(fontWeight: FontWeight.w700),
               ),
               const SizedBox(height: 8),
               const Text(
@@ -639,7 +666,9 @@ class _BudgetScreenState extends State<BudgetScreen> {
               const SizedBox(height: 28),
               TextField(
                 controller: controller,
-                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
                 decoration: InputDecoration(
                   prefixText: '$symbol ',
                   labelText: 'Spending limit',
@@ -654,14 +683,17 @@ class _BudgetScreenState extends State<BudgetScreen> {
                   );
                   widget.onChanged();
                   if (mounted)
-                    ScaffoldMessenger.of(
-                      context,
-                    ).showSnackBar(const SnackBar(content: Text('Budget saved')));
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Budget saved')),
+                    );
                 },
                 child: const Text('Save budget'),
               ),
               const SizedBox(height: 28),
-              Text('Period start day', style: Theme.of(context).textTheme.titleMedium),
+              Text(
+                'Period start day',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
               const SizedBox(height: 4),
               Text(
                 'Your budget period runs from this day of the month to the day before it next month.',
@@ -673,7 +705,8 @@ class _BudgetScreenState extends State<BudgetScreen> {
                 decoration: const InputDecoration(labelText: 'Starts on'),
                 items: List.generate(
                   28,
-                  (i) => DropdownMenuItem(value: i + 1, child: Text('${i + 1}')),
+                  (i) =>
+                      DropdownMenuItem(value: i + 1, child: Text('${i + 1}')),
                 ),
                 onChanged: (v) async {
                   if (v == null) return;
@@ -687,7 +720,10 @@ class _BudgetScreenState extends State<BudgetScreen> {
               ),
               if (accounts.isNotEmpty) ...[
                 const SizedBox(height: 28),
-                Text('Accounts', style: Theme.of(context).textTheme.titleMedium),
+                Text(
+                  'Accounts',
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
                 const SizedBox(height: 4),
                 Text(
                   "Turn an account off to leave its spending out of the budget.",
@@ -733,6 +769,36 @@ class _SettingsScreenState extends State<SettingsScreen> {
       setState(() => _smsStatus = 'SMS access was not granted.');
       return;
     }
+    final report = await ingestHistoricSms();
+    await recategorizeReviewQueue();
+    widget.onChanged();
+    if (!mounted) return;
+    setState(() => _smsStatus = _describeIngest(report));
+  }
+
+  Future<void> _confirmRereadSms(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Re-read SMS?'),
+        content: const Text(
+          'Deletes transactions imported from SMS and reads your inbox '
+          'again. Manual and statement entries stay.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Re-read'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    await TallyDatabase.instance.deleteSmsRows();
     final report = await ingestHistoricSms();
     await recategorizeReviewQueue();
     widget.onChanged();
@@ -800,7 +866,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
   void _snack(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _exportTransactions() async {
@@ -844,7 +911,10 @@ class _SettingsScreenState extends State<SettingsScreen> {
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text('Accounts', style: Theme.of(context).textTheme.titleMedium),
+                  Text(
+                    'Accounts',
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
                   TextButton(
                     onPressed: () => _showAccountSheet(context),
                     child: const Text('Add'),
@@ -879,6 +949,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 onPressed: _scanSms,
                 child: const Text('Scan SMS inbox'),
               ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.restart_alt_outlined),
+              title: const Text('Re-read SMS'),
+              subtitle: const Text('Fix wrongly parsed SMS transactions'),
+              onTap: () => _confirmRereadSms(context),
             ),
             ListTile(
               leading: const Icon(Icons.file_upload_outlined),
@@ -982,7 +1058,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SizedBox(height: 10),
                 TextField(
                   controller: opening,
-                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
                   decoration: const InputDecoration(
                     labelText: 'Balance',
                     helperText: 'What your bank shows right now',
@@ -991,10 +1069,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const SizedBox(height: 10),
                 TextField(
                   controller: minBalance,
-                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
                   decoration: const InputDecoration(
                     labelText: 'Minimum balance (optional)',
-                    helperText: 'Tally warns you when the balance dips below this',
+                    helperText:
+                        'Tally warns you when the balance dips below this',
                   ),
                 ),
                 SwitchListTile(
@@ -1017,11 +1098,14 @@ class _SettingsScreenState extends State<SettingsScreen> {
                         id: existing?.id,
                         name: name.text.trim(),
                         last4: last4.text.trim(),
-                        openingBalanceMinor: existing?.openingBalanceMinor ?? typed,
+                        openingBalanceMinor:
+                            existing?.openingBalanceMinor ?? typed,
                         reportedBalanceMinor: reanchor
                             ? typed
                             : existing.reportedBalanceMinor,
-                        reportedAt: reanchor ? DateTime.now() : existing.reportedAt,
+                        reportedAt: reanchor
+                            ? DateTime.now()
+                            : existing.reportedAt,
                         inBudget: inBudget,
                         minBalanceMinor: parseMoney(minBalance.text),
                       );
@@ -1110,16 +1194,17 @@ void showTransactionSheet(
   final accounts = await TallyDatabase.instance.accounts();
   if (accounts.isEmpty) {
     if (context.mounted)
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Add an account first')));
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('Add an account first')));
     return;
   }
   if (!context.mounted) return;
 
   final merchant = TextEditingController(text: existing?.merchant ?? '');
   final amount = TextEditingController(
-    text: existing == null ? '' : (existing.amountMinor / 100).toStringAsFixed(2),
+    text: existing == null
+        ? ''
+        : (existing.amountMinor / 100).toStringAsFixed(2),
   );
   var kind = existing?.kind ?? TransactionKind.expense;
   var category = existing?.category ?? kCategories.first;
@@ -1222,7 +1307,8 @@ void showTransactionSheet(
                   items: kCategories
                       .map((v) => DropdownMenuItem(value: v, child: Text(v)))
                       .toList(),
-                  onChanged: (v) => setSheetState(() => category = v ?? category),
+                  onChanged: (v) =>
+                      setSheetState(() => category = v ?? category),
                 ),
                 SwitchListTile(
                   contentPadding: EdgeInsets.zero,
@@ -1242,7 +1328,9 @@ void showTransactionSheet(
                         transferAccountId == null)
                       return;
                     final isTransfer = kind == TransactionKind.transfer;
-                    final resolvedCategory = isTransfer ? 'Transfers' : category;
+                    final resolvedCategory = isTransfer
+                        ? 'Transfers'
+                        : category;
                     final resolvedMerchant = merchant.text.trim().isEmpty
                         ? (isTransfer ? 'Transfer' : merchant.text.trim())
                         : merchant.text.trim();
@@ -1256,7 +1344,9 @@ void showTransactionSheet(
                           merchant: resolvedMerchant,
                           category: resolvedCategory,
                           accountId: accountId,
-                          transferAccountId: isTransfer ? transferAccountId : null,
+                          transferAccountId: isTransfer
+                              ? transferAccountId
+                              : null,
                           excludeFromBudget: isTransfer ? true : exclude,
                         ),
                       );
@@ -1268,7 +1358,9 @@ void showTransactionSheet(
                         accountId: accountId,
                         category: resolvedCategory,
                         excludeFromBudget: isTransfer ? true : exclude,
-                        transferAccountId: isTransfer ? transferAccountId : null,
+                        transferAccountId: isTransfer
+                            ? transferAccountId
+                            : null,
                         clearTransferAccount: !isTransfer,
                       );
                       if (!isTransfer && category != existing.category)

@@ -83,7 +83,10 @@ abstract final class TallyTheme {
           borderRadius: BorderRadius.circular(Corners.card),
         ),
       ),
-      dividerTheme: DividerThemeData(color: scheme.outlineVariant, thickness: 1),
+      dividerTheme: DividerThemeData(
+        color: scheme.outlineVariant,
+        thickness: 1,
+      ),
       listTileTheme: ListTileThemeData(
         shape: control,
         subtitleTextStyle: text.bodyMedium?.merge(muted),

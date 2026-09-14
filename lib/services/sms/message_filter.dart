@@ -58,7 +58,21 @@ const _requestMarkers = [
   'kindly pay',
   'please pay',
   'overdue',
+  // Fund-house confirmations (SIP purchase/redemption receipts) quote a
+  // folio, NAV and units allotted, but no bank account ever moves on them -
+  // the bank's own NACH debit SMS is the one that does.
+  'folio',
+  'nav of',
+  'units allotted',
 ];
+
+/// A transaction quoted in a currency Tally cannot convert. Booking the INR
+/// figure that follows (usually a card limit) would silently overstate
+/// spend, so these are dropped rather than guessed at.
+final _foreignCurrencyRegex = RegExp(
+  r'\b(?:USD|EUR|GBP|AED|SGD|AUD|CAD|JPY)\s*[\d,]+(?:\.\d+)?\s+(?:spent|debited|withdrawn|charged)',
+  caseSensitive: false,
+);
 
 const _transactionMarkers = [
   'debited',
@@ -86,6 +100,7 @@ MessageClass classifyMessage(String body) {
   // OTPs first: they are the one class that also carries "do not share" style
   // wording that would otherwise read as promotional.
   if (_otpMarkers.any(text.contains)) return MessageClass.otp;
+  if (_foreignCurrencyRegex.hasMatch(text)) return MessageClass.request;
   if (_requestMarkers.any(text.contains)) return MessageClass.request;
   final transactional = _transactionMarkers.any(text.contains);
   // A promotional message that also says "debited" is rare; a transaction alert
