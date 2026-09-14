@@ -14,6 +14,8 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     private var smsResult: MethodChannel.Result? = null
     private var fileResult: MethodChannel.Result? = null
+    private var saveResult: MethodChannel.Result? = null
+    private var pendingSaveBytes: ByteArray? = null
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
         MethodChannel(engine.dartExecutor.binaryMessenger, "com.navknight.tally/platform").setMethodCallHandler { call, result ->
@@ -22,6 +24,13 @@ class MainActivity : FlutterActivity() {
                 "takePendingSms" -> { val p = getSharedPreferences("tally_sms", MODE_PRIVATE); val raw = p.getString("pending", "") ?: ""; p.edit().remove("pending").apply(); result.success(decodeMessages(raw)) }
                 "readHistoricSms" -> result.success(readHistoricSms())
                 "pickStatement" -> { fileResult = result; startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*"; putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("text/csv", "text/comma-separated-values", "text/plain", "application/pdf")) }, 42) }
+                "saveFile" -> {
+                    val name = call.argument<String>("name") ?: "export.csv"
+                    val mimeType = call.argument<String>("mimeType") ?: "text/csv"
+                    saveResult = result
+                    pendingSaveBytes = call.argument<ByteArray>("bytes")
+                    startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = mimeType; putExtra(Intent.EXTRA_TITLE, name) }, 43)
+                }
                 else -> result.notImplemented()
             }
         }
@@ -56,6 +65,17 @@ class MainActivity : FlutterActivity() {
             }
             fileResult?.success(picked)
             fileResult = null
+        }
+        if (code == 43) {
+            val uri = if (resultCode == Activity.RESULT_OK) data?.data else null
+            val bytes = pendingSaveBytes
+            val saved = if (uri != null && bytes != null) {
+                contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
+                true
+            } else false
+            pendingSaveBytes = null
+            saveResult?.success(saved)
+            saveResult = null
         }
     }
 }

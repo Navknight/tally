@@ -1,15 +1,19 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
 import 'app/theme.dart';
+import 'core/budget_period.dart';
 import 'core/money.dart';
 import 'data/tally_database.dart';
+import 'insights.dart';
 import 'models/account.dart';
 import 'models/categories.dart';
 import 'models/transaction.dart';
 import 'platform/android_bridge.dart';
+import 'services/export.dart';
 import 'services/sms_ingestion.dart';
 import 'services/statement_import.dart';
 
@@ -229,59 +233,83 @@ class _TallyShellState extends State<TallyShell> {
       HomeScreen(key: ValueKey(_refresh), onChanged: _changed),
       TransactionsScreen(key: ValueKey(_refresh), onChanged: _changed),
       BudgetScreen(key: ValueKey(_refresh), onChanged: _changed),
+      InsightsScreen(key: ValueKey(_refresh), onChanged: _changed),
       SettingsScreen(key: ValueKey(_refresh), onChanged: _changed),
     ];
-    return Scaffold(
-      body: pages[_tab],
-      floatingActionButton: _tab < 2
-          ? FloatingActionButton(
-              onPressed: () => showTransactionSheet(context, _changed),
-              child: const Icon(Icons.add),
-            )
-          : null,
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tab,
-        onDestinationSelected: (i) => setState(() => _tab = i),
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.home_outlined),
-            selectedIcon: Icon(Icons.home),
-            label: 'Home',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.receipt_long_outlined),
-            selectedIcon: Icon(Icons.receipt_long),
-            label: 'Activity',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.savings_outlined),
-            selectedIcon: Icon(Icons.savings),
-            label: 'Budget',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.settings_outlined),
-            selectedIcon: Icon(Icons.settings),
-            label: 'Settings',
-          ),
-        ],
+    return PopScope(
+      canPop: _tab == 0,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop) setState(() => _tab = 0);
+      },
+      child: Scaffold(
+        body: pages[_tab],
+        floatingActionButton: _tab < 2
+            ? FloatingActionButton(
+                onPressed: () => showTransactionSheet(context, _changed),
+                child: const Icon(Icons.add),
+              )
+            : null,
+        bottomNavigationBar: NavigationBar(
+          selectedIndex: _tab,
+          onDestinationSelected: (i) => setState(() => _tab = i),
+          destinations: const [
+            NavigationDestination(
+              icon: Icon(Icons.home_outlined),
+              selectedIcon: Icon(Icons.home),
+              label: 'Home',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.receipt_long_outlined),
+              selectedIcon: Icon(Icons.receipt_long),
+              label: 'Activity',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.savings_outlined),
+              selectedIcon: Icon(Icons.savings),
+              label: 'Budget',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.insights_outlined),
+              selectedIcon: Icon(Icons.insights),
+              label: 'Insights',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.settings_outlined),
+              selectedIcon: Icon(Icons.settings),
+              label: 'Settings',
+            ),
+          ],
+        ),
       ),
     );
   }
 }
+
+/// Bottom inset a sheet needs so its content clears the gesture/3-button nav
+/// bar and any open keyboard, since the app draws edge-to-edge.
+double sheetBottomInset(BuildContext context) =>
+    MediaQuery.viewPaddingOf(context).bottom +
+    MediaQuery.viewInsetsOf(context).bottom;
 
 class HomeScreen extends StatelessWidget {
   const HomeScreen({super.key, required this.onChanged});
   final VoidCallback onChanged;
   @override
   Widget build(BuildContext context) => FutureBuilder<List<Object?>>(
-    future: Future.wait([
+    future: () async {
+      final db = TallyDatabase.instance;
+      final startDay = await db.budgetStartDay();
+      final period = budgetPeriod(DateTime.now(), startDay);
       // ponytail: loads every row to sum balances; move to SQL SUM if it drags.
-      TallyDatabase.instance.transactions(limit: -1),
-      TallyDatabase.instance.accounts(),
-      TallyDatabase.instance.currency(),
-      TallyDatabase.instance.setting('monthly_budget'),
-      TallyDatabase.instance.reviewQueue(),
-    ]),
+      return Future.wait([
+        db.transactions(limit: -1),
+        db.accounts(),
+        db.currency(),
+        db.setting('monthly_budget'),
+        db.reviewQueue(),
+        db.spentInPeriod(period),
+      ]);
+    }(),
     builder: (context, snapshot) {
       if (!snapshot.hasData)
         return const Scaffold(body: Center(child: CircularProgressIndicator()));
@@ -291,22 +319,22 @@ class HomeScreen extends StatelessWidget {
       final symbol = values[2] as String;
       final budget = int.tryParse(values[3] as String? ?? '0') ?? 0;
       final review = values[4] as List<TallyTransaction>;
-      final now = DateTime.now();
-      final month = tx
-          .where(
-            (t) =>
-                t.occurredAt.year == now.year &&
-                t.occurredAt.month == now.month,
-          )
-          .toList();
-      final spent = month
-          .where((t) => t.kind == TransactionKind.expense)
-          .fold<int>(0, (sum, t) => sum + t.amountMinor);
+      final spent = values[5] as int;
       final balance = totalBalance(accounts, tx);
+      final scheme = Theme.of(context).colorScheme;
+      final lowAccounts = accounts.where((a) {
+        final min = a.minBalanceMinor;
+        return min != null && accountBalance(a, tx) < min;
+      }).toList();
       return Scaffold(
         appBar: AppBar(title: const Text('Tally')),
         body: ListView(
-          padding: const EdgeInsets.fromLTRB(20, 12, 20, 100),
+          padding: EdgeInsets.fromLTRB(
+            20,
+            12,
+            20,
+            100 + MediaQuery.viewPaddingOf(context).bottom,
+          ),
           children: [
             Text('Available', style: Theme.of(context).textTheme.bodySmall),
             Text(
@@ -315,8 +343,11 @@ class HomeScreen extends StatelessWidget {
             ),
             if (accounts.length > 1) ...[
               const SizedBox(height: 12),
-              ...accounts.map(
-                (a) => Padding(
+              ...accounts.map((a) {
+                final accBalance = accountBalance(a, tx);
+                final low = a.minBalanceMinor != null &&
+                    accBalance < a.minBalanceMinor!;
+                return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 2),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -326,12 +357,38 @@ class HomeScreen extends StatelessWidget {
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                       Text(
-                        money(accountBalance(a, tx), symbol),
-                        style: Theme.of(
-                          context,
-                        ).textTheme.bodySmall?.copyWith(fontFeatures: tabular),
+                        money(accBalance, symbol),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          fontFeatures: tabular,
+                          color: low ? scheme.error : null,
+                          fontWeight: low ? FontWeight.w600 : null,
+                        ),
                       ),
                     ],
+                  ),
+                );
+              }),
+            ],
+            if (lowAccounts.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              ...lowAccounts.map(
+                (a) => Card(
+                  color: scheme.errorContainer,
+                  child: Padding(
+                    padding: const EdgeInsets.all(14),
+                    child: Row(
+                      children: [
+                        Icon(Icons.warning_amber_rounded, color: scheme.onErrorContainer),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            '${a.name} is below its minimum balance of '
+                            '${money(a.minBalanceMinor!, symbol)}',
+                            style: TextStyle(color: scheme.onErrorContainer),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
@@ -346,7 +403,7 @@ class HomeScreen extends StatelessWidget {
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
-                        const Text('This month'),
+                        const Text('This budget period'),
                         Text(
                           money(spent, symbol),
                           style: const TextStyle(
@@ -388,7 +445,7 @@ class HomeScreen extends StatelessWidget {
                 (t) => TransactionTile(
                   transaction: t,
                   symbol: symbol,
-                  onTap: () => showCategoryPicker(context, t, onChanged),
+                  onTap: () => showTransactionSheet(context, onChanged, existing: t),
                 ),
               ),
             ],
@@ -409,7 +466,7 @@ class HomeScreen extends StatelessWidget {
                   (t) => TransactionTile(
                     transaction: t,
                     symbol: symbol,
-                    onTap: () => showCategoryPicker(context, t, onChanged),
+                    onTap: () => showTransactionSheet(context, onChanged, existing: t),
                   ),
                 ),
           ],
@@ -439,7 +496,12 @@ class TransactionsScreen extends StatelessWidget {
         body: transactions.isEmpty
             ? const Center(child: Text('No transactions yet.'))
             : ListView.builder(
-                padding: const EdgeInsets.fromLTRB(20, 8, 20, 100),
+                padding: EdgeInsets.fromLTRB(
+                  20,
+                  8,
+                  20,
+                  100 + MediaQuery.viewPaddingOf(context).bottom,
+                ),
                 itemCount: transactions.length,
                 itemBuilder: (_, index) {
                   final transaction = transactions[index];
@@ -459,8 +521,11 @@ class TransactionsScreen extends StatelessWidget {
                     child: TransactionTile(
                       transaction: transaction,
                       symbol: symbol,
-                      onTap: () =>
-                          showCategoryPicker(context, transaction, onChanged),
+                      onTap: () => showTransactionSheet(
+                        context,
+                        onChanged,
+                        existing: transaction,
+                      ),
                     ),
                   );
                 },
@@ -483,14 +548,17 @@ class TransactionTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final positive = transaction.kind == TransactionKind.income;
+    final isTransfer = transaction.kind == TransactionKind.transfer;
     final scheme = Theme.of(context).colorScheme;
+    final color = categoryColor(transaction.category);
+    final sign = isTransfer ? '' : (positive ? '+' : '-');
     return ListTile(
       onTap: onTap,
       contentPadding: EdgeInsets.zero,
       leading: CircleAvatar(
-        backgroundColor: scheme.surfaceContainerHigh,
-        foregroundColor: positive ? scheme.primary : scheme.onSurfaceVariant,
-        child: Icon(positive ? Icons.south_west : Icons.north_east, size: 20),
+        backgroundColor: color.withValues(alpha: 0.16),
+        foregroundColor: color,
+        child: Icon(categoryIcon(transaction.category), size: 20),
       ),
       title: Text(transaction.merchant),
       subtitle: Text(
@@ -498,7 +566,7 @@ class TransactionTile extends StatelessWidget {
         '${transaction.needsReview ? ' · tap to label' : ''}',
       ),
       trailing: Text(
-        '${positive ? '+' : '-'}${money(transaction.amountMinor, symbol)}',
+        '$sign${money(transaction.amountMinor, symbol)}',
         style: TextStyle(
           fontWeight: FontWeight.w600,
           fontFeatures: tabular,
@@ -507,63 +575,6 @@ class TransactionTile extends StatelessWidget {
       ),
     );
   }
-}
-
-/// Bottom sheet to set or correct a transaction's category. Calling
-/// [confirmCategory] both saves the choice and sweeps other unlabelled rows
-/// from the same merchant, so the snackbar reports how many were caught up.
-void showCategoryPicker(
-  BuildContext context,
-  TallyTransaction transaction,
-  VoidCallback onSaved,
-) {
-  showModalBottomSheet(
-    context: context,
-    builder: (sheetContext) => SafeArea(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
-            child: Align(
-              alignment: Alignment.centerLeft,
-              child: Text(
-                'Category for ${transaction.merchant}',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-            ),
-          ),
-          ...kCategories.map(
-            (category) => ListTile(
-              title: Text(category),
-              trailing: category == transaction.category
-                  ? const Icon(Icons.check)
-                  : null,
-              onTap: () async {
-                final appliedToOthers = await confirmCategory(
-                  transaction,
-                  category,
-                );
-                if (sheetContext.mounted) Navigator.pop(sheetContext);
-                onSaved();
-                if (context.mounted)
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text(
-                        appliedToOthers > 0
-                            ? 'Saved. Applied to $appliedToOthers more from ${transaction.merchant}'
-                            : 'Saved',
-                      ),
-                    ),
-                  );
-              },
-            ),
-          ),
-          const SizedBox(height: 8),
-        ],
-      ),
-    ),
-  );
 }
 
 class BudgetScreen extends StatefulWidget {
@@ -577,6 +588,8 @@ class _BudgetScreenState extends State<BudgetScreen> {
   final controller = TextEditingController();
   String symbol = '₹';
   bool loading = true;
+  int startDay = 1;
+  List<Account> accounts = const [];
   @override
   void initState() {
     super.initState();
@@ -584,15 +597,13 @@ class _BudgetScreenState extends State<BudgetScreen> {
   }
 
   Future<void> _load() async {
+    final db = TallyDatabase.instance;
     controller.text =
-        ((int.tryParse(
-                      await TallyDatabase.instance.setting('monthly_budget') ??
-                          '0',
-                    ) ??
-                    0) /
-                100)
+        ((int.tryParse(await db.setting('monthly_budget') ?? '0') ?? 0) / 100)
             .toStringAsFixed(2);
-    symbol = await TallyDatabase.instance.currency();
+    symbol = await db.currency();
+    startDay = await db.budgetStartDay();
+    accounts = await db.accounts();
     if (mounted) setState(() => loading = false);
   }
 
@@ -604,51 +615,104 @@ class _BudgetScreenState extends State<BudgetScreen> {
 
   @override
   Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('Monthly budget')),
+    appBar: AppBar(title: const Text('Budget')),
     body: loading
         ? const Center(child: CircularProgressIndicator())
-        : Padding(
-            padding: const EdgeInsets.all(20),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  'One number is enough.',
-                  style: Theme.of(context).textTheme.headlineSmall
-                      ?.copyWith(fontWeight: FontWeight.w700),
+        : ListView(
+            padding: EdgeInsets.fromLTRB(
+              20,
+              20,
+              20,
+              20 + MediaQuery.viewPaddingOf(context).bottom,
+            ),
+            children: [
+              Text(
+                'One number is enough.',
+                style: Theme.of(
+                  context,
+                ).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Set a gentle spending limit for the period. Tally will keep the rest simple.',
+              ),
+              const SizedBox(height: 28),
+              TextField(
+                controller: controller,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                decoration: InputDecoration(
+                  prefixText: '$symbol ',
+                  labelText: 'Spending limit',
                 ),
-                const SizedBox(height: 8),
-                const Text(
-                  'Set a gentle spending limit for this month. Tally will keep the rest simple.',
+              ),
+              const SizedBox(height: 16),
+              FilledButton(
+                onPressed: () async {
+                  await TallyDatabase.instance.setSetting(
+                    'monthly_budget',
+                    '${parseMoney(controller.text) ?? 0}',
+                  );
+                  widget.onChanged();
+                  if (mounted)
+                    ScaffoldMessenger.of(
+                      context,
+                    ).showSnackBar(const SnackBar(content: Text('Budget saved')));
+                },
+                child: const Text('Save budget'),
+              ),
+              const SizedBox(height: 28),
+              Text('Period start day', style: Theme.of(context).textTheme.titleMedium),
+              const SizedBox(height: 4),
+              Text(
+                'Your budget period runs from this day of the month to the day before it next month.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<int>(
+                initialValue: startDay,
+                decoration: const InputDecoration(labelText: 'Starts on'),
+                items: List.generate(
+                  28,
+                  (i) => DropdownMenuItem(value: i + 1, child: Text('${i + 1}')),
                 ),
+                onChanged: (v) async {
+                  if (v == null) return;
+                  setState(() => startDay = v);
+                  await TallyDatabase.instance.setSetting(
+                    'budget_start_day',
+                    '$v',
+                  );
+                  widget.onChanged();
+                },
+              ),
+              if (accounts.isNotEmpty) ...[
                 const SizedBox(height: 28),
-                TextField(
-                  controller: controller,
-                  keyboardType: const TextInputType.numberWithOptions(
-                    decimal: true,
-                  ),
-                  decoration: InputDecoration(
-                    prefixText: '$symbol ',
-                    labelText: 'Monthly spending limit',
-                  ),
+                Text('Accounts', style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 4),
+                Text(
+                  "Turn an account off to leave its spending out of the budget.",
+                  style: Theme.of(context).textTheme.bodySmall,
                 ),
-                const SizedBox(height: 16),
-                FilledButton(
-                  onPressed: () async {
-                    await TallyDatabase.instance.setSetting(
-                      'monthly_budget',
-                      '${parseMoney(controller.text) ?? 0}',
-                    );
-                    widget.onChanged();
-                    if (mounted)
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        const SnackBar(content: Text('Budget saved')),
+                ...accounts.map(
+                  (a) => SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: Text(a.name),
+                    subtitle: const Text('Count in budget'),
+                    value: a.inBudget,
+                    onChanged: (v) async {
+                      final updated = a.copyWith(inBudget: v);
+                      await TallyDatabase.instance.updateAccount(updated);
+                      setState(
+                        () => accounts = accounts
+                            .map((x) => x.id == a.id ? updated : x)
+                            .toList(),
                       );
-                  },
-                  child: const Text('Save budget'),
+                      widget.onChanged();
+                    },
+                  ),
                 ),
               ],
-            ),
+            ],
           ),
   );
 }
@@ -715,7 +779,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (!mounted) return null;
     return showModalBottomSheet<Account>(
       context: context,
-      builder: (sheetContext) => SafeArea(
+      useSafeArea: true,
+      builder: (sheetContext) => Padding(
+        padding: EdgeInsets.only(bottom: sheetBottomInset(sheetContext)),
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: accounts
@@ -737,6 +803,23 @@ class _SettingsScreenState extends State<SettingsScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
   }
 
+  Future<void> _exportTransactions() async {
+    final db = TallyDatabase.instance;
+    final rows = await db.transactions(limit: -1);
+    final accounts = await db.accounts();
+    final csv = transactionsCsv(rows, accounts);
+    final now = DateTime.now();
+    final name =
+        'tally-${now.year}-${now.month.toString().padLeft(2, '0')}-'
+        '${now.day.toString().padLeft(2, '0')}.csv';
+    final saved = await AndroidBridge.saveFile(
+      name,
+      'text/csv',
+      Uint8List.fromList(utf8.encode(csv)),
+    );
+    if (saved) _snack('Exported ${rows.length} transactions');
+  }
+
   @override
   Widget build(BuildContext context) => Scaffold(
     appBar: AppBar(title: const Text('Settings')),
@@ -745,7 +828,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
       builder: (context, snapshot) {
         final accounts = snapshot.data ?? const [];
         return ListView(
-          padding: const EdgeInsets.all(12),
+          padding: EdgeInsets.fromLTRB(
+            12,
+            12,
+            12,
+            12 + MediaQuery.viewPaddingOf(context).bottom,
+          ),
           children: [
             const ListTile(
               title: Text('Privacy'),
@@ -798,6 +886,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
               subtitle: const Text('Choose a CSV or PDF, or paste rows'),
               onTap: _importStatement,
             ),
+            ListTile(
+              leading: const Icon(Icons.file_download_outlined),
+              title: const Text('Export transactions'),
+              subtitle: const Text('Save every transaction as a CSV file'),
+              onTap: _exportTransactions,
+            ),
           ],
         );
       },
@@ -842,80 +936,109 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 .toStringAsFixed(2),
     );
     final initialBalance = opening.text;
+    final minBalance = TextEditingController(
+      text: existing?.minBalanceMinor == null
+          ? ''
+          : (existing!.minBalanceMinor! / 100).toStringAsFixed(2),
+    );
+    var inBudget = existing?.inBudget ?? true;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      builder: (sheetContext) => Padding(
-        padding: EdgeInsets.fromLTRB(
-          20,
-          20,
-          20,
-          MediaQuery.of(sheetContext).viewInsets.bottom + 20,
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              existing == null ? 'Add account' : 'Edit account',
-              style: Theme.of(context).textTheme.titleLarge,
+      useSafeArea: true,
+      builder: (sheetContext) => StatefulBuilder(
+        builder: (context, setSheetState) => Padding(
+          padding: EdgeInsets.fromLTRB(
+            20,
+            20,
+            20,
+            sheetBottomInset(context) + 20,
+          ),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  existing == null ? 'Add account' : 'Edit account',
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 16),
+                TextField(
+                  controller: name,
+                  autofocus: true,
+                  decoration: const InputDecoration(labelText: 'Account name'),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: last4,
+                  maxLength: 4,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(
+                    labelText: 'Last 4 digits (optional)',
+                    counterText: '',
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: opening,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  decoration: const InputDecoration(
+                    labelText: 'Balance',
+                    helperText: 'What your bank shows right now',
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: minBalance,
+                  keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                  decoration: const InputDecoration(
+                    labelText: 'Minimum balance (optional)',
+                    helperText: 'Tally warns you when the balance dips below this',
+                  ),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text('Count in budget'),
+                  value: inBudget,
+                  onChanged: (v) => setSheetState(() => inBudget = v),
+                ),
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: () async {
+                      if (name.text.trim().isEmpty) return;
+                      final typed = parseMoney(opening.text) ?? 0;
+                      // A changed balance means "this is what I have now".
+                      final reanchor =
+                          existing == null || opening.text != initialBalance;
+                      final account = Account(
+                        id: existing?.id,
+                        name: name.text.trim(),
+                        last4: last4.text.trim(),
+                        openingBalanceMinor: existing?.openingBalanceMinor ?? typed,
+                        reportedBalanceMinor: reanchor
+                            ? typed
+                            : existing.reportedBalanceMinor,
+                        reportedAt: reanchor ? DateTime.now() : existing.reportedAt,
+                        inBudget: inBudget,
+                        minBalanceMinor: parseMoney(minBalance.text),
+                      );
+                      if (existing == null)
+                        await TallyDatabase.instance.addAccount(account);
+                      else
+                        await TallyDatabase.instance.updateAccount(account);
+                      if (sheetContext.mounted) Navigator.pop(sheetContext);
+                      widget.onChanged();
+                      setState(() {});
+                    },
+                    child: const Text('Save account'),
+                  ),
+                ),
+              ],
             ),
-            const SizedBox(height: 16),
-            TextField(
-              controller: name,
-              autofocus: true,
-              decoration: const InputDecoration(labelText: 'Account name'),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: last4,
-              maxLength: 4,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(
-                labelText: 'Last 4 digits (optional)',
-                counterText: '',
-              ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: opening,
-              keyboardType: const TextInputType.numberWithOptions(decimal: true),
-              decoration: const InputDecoration(
-                labelText: 'Balance',
-                helperText: 'What your bank shows right now',
-              ),
-            ),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton(
-                onPressed: () async {
-                  if (name.text.trim().isEmpty) return;
-                  final typed = parseMoney(opening.text) ?? 0;
-                  // A changed balance means "this is what I have now".
-                  final reanchor =
-                      existing == null || opening.text != initialBalance;
-                  final account = Account(
-                    id: existing?.id,
-                    name: name.text.trim(),
-                    last4: last4.text.trim(),
-                    openingBalanceMinor: existing?.openingBalanceMinor ?? typed,
-                    reportedBalanceMinor: reanchor
-                        ? typed
-                        : existing.reportedBalanceMinor,
-                    reportedAt: reanchor ? DateTime.now() : existing.reportedAt,
-                  );
-                  if (existing == null)
-                    await TallyDatabase.instance.addAccount(account);
-                  else
-                    await TallyDatabase.instance.updateAccount(account);
-                  if (sheetContext.mounted) Navigator.pop(sheetContext);
-                  widget.onChanged();
-                  setState(() {});
-                },
-                child: const Text('Save account'),
-              ),
-            ),
-          ],
+          ),
         ),
       ),
     );
@@ -926,12 +1049,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
+      useSafeArea: true,
       builder: (sheetContext) => Padding(
         padding: EdgeInsets.fromLTRB(
           20,
           20,
           20,
-          MediaQuery.of(sheetContext).viewInsets.bottom + 20,
+          sheetBottomInset(sheetContext) + 20,
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -974,93 +1098,207 @@ class _SettingsScreenState extends State<SettingsScreen> {
 String _describeIngest(IngestReport report) =>
     '${report.inserted} added, ${report.duplicates} already saved, ${report.ignored} skipped';
 
-void showTransactionSheet(BuildContext context, VoidCallback onSaved) {
-  final merchant = TextEditingController();
-  final amount = TextEditingController();
-  var kind = TransactionKind.expense;
-  var category = 'Other';
+/// Bottom sheet for both adding a transaction and editing one (tap any
+/// tile). [existing] null means "add"; otherwise the sheet edits that row,
+/// offers delete, and re-runs [confirmCategory] when the category changes so
+/// the learner still sees the correction.
+void showTransactionSheet(
+  BuildContext context,
+  VoidCallback onSaved, {
+  TallyTransaction? existing,
+}) async {
+  final accounts = await TallyDatabase.instance.accounts();
+  if (accounts.isEmpty) {
+    if (context.mounted)
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Add an account first')));
+    return;
+  }
+  if (!context.mounted) return;
+
+  final merchant = TextEditingController(text: existing?.merchant ?? '');
+  final amount = TextEditingController(
+    text: existing == null ? '' : (existing.amountMinor / 100).toStringAsFixed(2),
+  );
+  var kind = existing?.kind ?? TransactionKind.expense;
+  var category = existing?.category ?? kCategories.first;
+  var accountId = existing?.accountId ?? accounts.first.id;
+  var transferAccountId = existing?.transferAccountId;
+  var exclude = existing?.excludeFromBudget ?? false;
+
   showModalBottomSheet(
     context: context,
     isScrollControlled: true,
+    useSafeArea: true,
     builder: (sheetContext) => StatefulBuilder(
       builder: (context, setSheetState) => Padding(
         padding: EdgeInsets.fromLTRB(
           20,
           20,
           20,
-          MediaQuery.of(context).viewInsets.bottom + 20,
+          sheetBottomInset(context) + 20,
         ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              'Add transaction',
-              style: Theme.of(context).textTheme.titleLarge,
-            ),
-            const SizedBox(height: 16),
-            SegmentedButton<TransactionKind>(
-              segments: const [
-                ButtonSegment(
-                  value: TransactionKind.expense,
-                  label: Text('Expense'),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                existing == null ? 'Add transaction' : 'Edit transaction',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 16),
+              SegmentedButton<TransactionKind>(
+                segments: const [
+                  ButtonSegment(
+                    value: TransactionKind.expense,
+                    label: Text('Expense'),
+                  ),
+                  ButtonSegment(
+                    value: TransactionKind.income,
+                    label: Text('Income'),
+                  ),
+                  ButtonSegment(
+                    value: TransactionKind.transfer,
+                    label: Text('Transfer'),
+                  ),
+                ],
+                selected: {kind},
+                onSelectionChanged: (v) => setSheetState(() => kind = v.first),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: merchant,
+                autofocus: existing == null,
+                decoration: InputDecoration(
+                  labelText: kind == TransactionKind.transfer
+                      ? 'Note (optional)'
+                      : 'Merchant or description',
                 ),
-                ButtonSegment(
-                  value: TransactionKind.income,
-                  label: Text('Income'),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: amount,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                decoration: const InputDecoration(labelText: 'Amount'),
+              ),
+              const SizedBox(height: 10),
+              DropdownButtonFormField<int>(
+                initialValue: accountId,
+                decoration: const InputDecoration(labelText: 'Account'),
+                items: accounts
+                    .map(
+                      (a) => DropdownMenuItem(value: a.id, child: Text(a.name)),
+                    )
+                    .toList(),
+                onChanged: (v) => setSheetState(() => accountId = v),
+              ),
+              if (kind == TransactionKind.transfer) ...[
+                const SizedBox(height: 10),
+                DropdownButtonFormField<int>(
+                  initialValue: accounts.any((a) => a.id == transferAccountId)
+                      ? transferAccountId
+                      : null,
+                  decoration: const InputDecoration(labelText: 'To account'),
+                  items: accounts
+                      .where((a) => a.id != accountId)
+                      .map(
+                        (a) =>
+                            DropdownMenuItem(value: a.id, child: Text(a.name)),
+                      )
+                      .toList(),
+                  onChanged: (v) => setSheetState(() => transferAccountId = v),
+                ),
+              ] else ...[
+                const SizedBox(height: 10),
+                DropdownButtonFormField<String>(
+                  initialValue: kCategories.contains(category)
+                      ? category
+                      : kCategories.first,
+                  decoration: const InputDecoration(labelText: 'Category'),
+                  items: kCategories
+                      .map((v) => DropdownMenuItem(value: v, child: Text(v)))
+                      .toList(),
+                  onChanged: (v) => setSheetState(() => category = v ?? category),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text("Don't count in budget"),
+                  value: exclude,
+                  onChanged: (v) => setSheetState(() => exclude = v),
                 ),
               ],
-              selected: {kind},
-              onSelectionChanged: (v) => setSheetState(() => kind = v.first),
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              controller: merchant,
-              autofocus: true,
-              decoration: const InputDecoration(
-                labelText: 'Merchant or description',
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: () async {
+                    final minor = parseMoney(amount.text);
+                    if (minor == null || accountId == null) return;
+                    if (kind == TransactionKind.transfer &&
+                        transferAccountId == null)
+                      return;
+                    final isTransfer = kind == TransactionKind.transfer;
+                    final resolvedCategory = isTransfer ? 'Transfers' : category;
+                    final resolvedMerchant = merchant.text.trim().isEmpty
+                        ? (isTransfer ? 'Transfer' : merchant.text.trim())
+                        : merchant.text.trim();
+                    if (existing == null) {
+                      await TallyDatabase.instance.add(
+                        TallyTransaction(
+                          id: null,
+                          amountMinor: minor,
+                          kind: kind,
+                          occurredAt: DateTime.now(),
+                          merchant: resolvedMerchant,
+                          category: resolvedCategory,
+                          accountId: accountId,
+                          transferAccountId: isTransfer ? transferAccountId : null,
+                          excludeFromBudget: isTransfer ? true : exclude,
+                        ),
+                      );
+                    } else {
+                      final updated = existing.copyWith(
+                        merchant: resolvedMerchant,
+                        amountMinor: minor,
+                        kind: kind,
+                        accountId: accountId,
+                        category: resolvedCategory,
+                        excludeFromBudget: isTransfer ? true : exclude,
+                        transferAccountId: isTransfer ? transferAccountId : null,
+                        clearTransferAccount: !isTransfer,
+                      );
+                      if (!isTransfer && category != existing.category)
+                        await confirmCategory(updated, category);
+                      else
+                        await TallyDatabase.instance.updateTransaction(updated);
+                    }
+                    if (sheetContext.mounted) Navigator.pop(sheetContext);
+                    onSaved();
+                  },
+                  child: const Text('Save transaction'),
+                ),
               ),
-            ),
-            const SizedBox(height: 10),
-            TextField(
-              controller: amount,
-              keyboardType: const TextInputType.numberWithOptions(
-                decimal: true,
-              ),
-              decoration: const InputDecoration(labelText: 'Amount'),
-            ),
-            const SizedBox(height: 10),
-            DropdownButtonFormField<String>(
-              initialValue: category,
-              decoration: const InputDecoration(labelText: 'Category'),
-              items: kCategories
-                  .map((v) => DropdownMenuItem(value: v, child: Text(v)))
-                  .toList(),
-              onChanged: (v) => category = v ?? category,
-            ),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: FilledButton(
-                onPressed: () async {
-                  final minor = parseMoney(amount.text);
-                  if (minor == null || merchant.text.trim().isEmpty) return;
-                  await TallyDatabase.instance.add(
-                    TallyTransaction(
-                      id: null,
-                      amountMinor: minor,
-                      kind: kind,
-                      occurredAt: DateTime.now(),
-                      merchant: merchant.text.trim(),
-                      category: category,
-                    ),
-                  );
-                  if (sheetContext.mounted) Navigator.pop(sheetContext);
-                  onSaved();
-                },
-                child: const Text('Save transaction'),
-              ),
-            ),
-          ],
+              if (existing != null) ...[
+                const SizedBox(height: 8),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    icon: const Icon(Icons.delete_outline),
+                    label: const Text('Delete'),
+                    onPressed: () async {
+                      await TallyDatabase.instance.delete(existing.id!);
+                      if (sheetContext.mounted) Navigator.pop(sheetContext);
+                      onSaved();
+                    },
+                  ),
+                ),
+              ],
+            ],
+          ),
         ),
       ),
     ),

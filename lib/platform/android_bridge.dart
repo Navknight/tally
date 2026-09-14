@@ -51,6 +51,22 @@ class AndroidBridge {
           : Uint8List.fromList(List<int>.from(bytes as List)),
     );
   }
+
+  /// Opens the system "save as" dialog for [bytes]. Returns whether the user
+  /// went through with it; false when cancelled or the host isn't Android.
+  static Future<bool> saveFile(
+    String name,
+    String mimeType,
+    Uint8List bytes,
+  ) async {
+    if (!Platform.isAndroid) return false;
+    return (await _channel.invokeMethod<bool>('saveFile', {
+          'name': name,
+          'mimeType': mimeType,
+          'bytes': bytes,
+        })) ??
+        false;
+  }
 }
 
 class PickedFile {

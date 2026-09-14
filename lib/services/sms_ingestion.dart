@@ -137,6 +137,7 @@ Future<IngestReport> ingestSms(Iterable<BankSms> messages) async {
           );
     }
   }
+  await db.linkSelfTransfers();
   return report;
 }
 
@@ -237,6 +238,7 @@ Future<int> ingestStatementRows({
     final last = withBalance.last;
     await db.recordReportedBalance(accountId, last.balanceMinor!, last.date);
   }
+  await db.linkSelfTransfers();
   return inserted;
 }
 

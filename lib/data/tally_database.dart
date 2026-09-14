@@ -1,9 +1,11 @@
 import 'package:path/path.dart';
 import 'package:sqflite/sqflite.dart';
 
+import '../core/budget_period.dart';
 import '../models/account.dart';
 import '../models/categories.dart';
 import '../models/transaction.dart';
+import '../models/transfer.dart';
 import '../services/categorizer.dart';
 
 /// Single SQLite file, opened lazily. Also backs the categorizer's learning
@@ -16,7 +18,7 @@ class TallyDatabase implements CategoryStore {
   Future<Database> get _db async =>
       _database ??= await openDatabase(
         join(await getDatabasesPath(), 'tally.db'),
-        version: 3,
+        version: 4,
         onCreate: (db, _) async {
           await db.execute('''CREATE TABLE settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL)''');
@@ -27,7 +29,9 @@ class TallyDatabase implements CategoryStore {
             source TEXT NOT NULL DEFAULT 'manual', fingerprint TEXT,
             account_id INTEGER, reference TEXT, balance_after_minor INTEGER,
             category_source TEXT NOT NULL DEFAULT 'manual',
-            needs_review INTEGER NOT NULL DEFAULT 0)''');
+            needs_review INTEGER NOT NULL DEFAULT 0,
+            exclude_from_budget INTEGER NOT NULL DEFAULT 0,
+            transfer_account_id INTEGER)''');
           await db.execute(
             'CREATE INDEX tx_date ON transactions(occurred_at DESC)',
           );
@@ -57,6 +61,21 @@ class TallyDatabase implements CategoryStore {
             await _createV3(db);
             await _adoptLegacyOpeningBalance(db);
           }
+          if (oldVersion < 4) {
+            for (final column in const [
+              'exclude_from_budget INTEGER NOT NULL DEFAULT 0',
+              'transfer_account_id INTEGER',
+            ])
+              await db.execute('ALTER TABLE transactions ADD COLUMN $column');
+            // A fresh-from-<3 upgrade already created accounts with these
+            // columns via _createV3 above; only a v3 install needs them added.
+            if (oldVersion >= 3)
+              for (final column in const [
+                'in_budget INTEGER NOT NULL DEFAULT 1',
+                'min_balance_minor INTEGER',
+              ])
+                await db.execute('ALTER TABLE accounts ADD COLUMN $column');
+          }
         },
       );
 
@@ -64,7 +83,8 @@ class TallyDatabase implements CategoryStore {
     await db.execute('''CREATE TABLE accounts (
       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
       last4 TEXT NOT NULL DEFAULT '', opening_balance_minor INTEGER NOT NULL DEFAULT 0,
-      reported_balance_minor INTEGER, reported_at INTEGER)''');
+      reported_balance_minor INTEGER, reported_at INTEGER,
+      in_budget INTEGER NOT NULL DEFAULT 1, min_balance_minor INTEGER)''');
     await db.execute('''CREATE TABLE merchant_rules (
       merchant_key TEXT PRIMARY KEY, category TEXT NOT NULL,
       hits INTEGER NOT NULL DEFAULT 1)''');
@@ -108,6 +128,9 @@ class TallyDatabase implements CategoryStore {
   );
 
   Future<String> currency() async => await setting('currency') ?? '₹';
+
+  Future<int> budgetStartDay() async =>
+      int.tryParse(await setting('budget_start_day') ?? '1') ?? 1;
 
   // ---------------------------------------------------------------- accounts
 
@@ -203,15 +226,21 @@ class TallyDatabase implements CategoryStore {
       0;
 
   /// The bank and a UPI app often both text about one payment, and statements
-  /// repeat it again; a shared reference number with the same amount is the
-  /// same money.
+  /// repeat it again; a shared reference number with the same amount on the
+  /// same account is the same money. Scoped to the account so the two legs of
+  /// a self transfer (same reference, same amount, different accounts) both
+  /// land in the ledger for [linkSelfTransfers] to pair up.
   Future<bool> _hasReference(TallyTransaction t) async =>
       (t.reference ?? '').isNotEmpty &&
       (await (await _db).query(
         'transactions',
         columns: ['id'],
-        where: 'reference = ? AND amount_minor = ?',
-        whereArgs: [t.reference, t.amountMinor],
+        where: t.accountId == null
+            ? 'reference = ? AND amount_minor = ? AND account_id IS NULL'
+            : 'reference = ? AND amount_minor = ? AND account_id = ?',
+        whereArgs: t.accountId == null
+            ? [t.reference, t.amountMinor]
+            : [t.reference, t.amountMinor, t.accountId],
         limit: 1,
       )).isNotEmpty;
 
@@ -229,6 +258,37 @@ class TallyDatabase implements CategoryStore {
       if (result is int && result > 0) inserted++;
     return inserted;
   }
+
+  /// Finds already-imported rows that are really two legs of one self
+  /// transfer, keeps the debit (turned into a transfer), and drops the
+  /// credit. Safe to call after every ingest: already-linked transfers don't
+  /// match [findSelfTransfers] again since their kind is no longer expense.
+  Future<int> linkSelfTransfers() async {
+    final db = await _db;
+    final rows = await transactions(limit: -1);
+    final matches = findSelfTransfers(rows);
+    for (final match in matches) {
+      await db.update(
+        'transactions',
+        {
+          'kind': TransactionKind.transfer.name,
+          'transfer_account_id': match.credit.accountId,
+          'exclude_from_budget': 1,
+          'category': 'Transfers',
+        },
+        where: 'id = ?',
+        whereArgs: [match.debit.id],
+      );
+      await db.delete('transactions', where: 'id = ?', whereArgs: [match.credit.id]);
+    }
+    return matches.length;
+  }
+
+  /// Total spend in [period] on accounts that count toward the budget,
+  /// excluding flagged rows, transfers, and rows with no account. The
+  /// filtering itself is [budgetSpent], a pure function tested without sqflite.
+  Future<int> spentInPeriod(BudgetPeriod period) async =>
+      budgetSpent(await transactions(limit: -1), await accounts(), period);
 
   Future<void> delete(int id) async =>
       (await _db).delete('transactions', where: 'id = ?', whereArgs: [id]);
@@ -360,20 +420,47 @@ class TallyDatabase implements CategoryStore {
     whereArgs: [merchantKey],
   );
 
-  /// Categories present in the ledger this month with their spend, largest
-  /// first. Computed in SQL so the UI never walks the whole table.
-  Future<List<(String, int)>> spendByCategory(DateTime month) async {
-    final start = DateTime(month.year, month.month).millisecondsSinceEpoch;
-    final end = DateTime(month.year, month.month + 1).millisecondsSinceEpoch;
+  /// Categories with budget-counted spend inside [period], largest first.
+  /// Computed in SQL so the UI never walks the whole table.
+  Future<List<(String, int)>> spendByCategory(BudgetPeriod period) async {
     final rows = await (await _db).rawQuery(
-      '''SELECT category, SUM(amount_minor) AS total FROM transactions
-         WHERE kind = ? AND occurred_at >= ? AND occurred_at < ?
-         GROUP BY category ORDER BY total DESC''',
-      [TransactionKind.expense.name, start, end],
+      '''SELECT t.category AS category, SUM(t.amount_minor) AS total FROM transactions t
+         JOIN accounts a ON a.id = t.account_id
+         WHERE t.kind = ? AND t.exclude_from_budget = 0 AND a.in_budget = 1
+           AND t.occurred_at >= ? AND t.occurred_at < ?
+         GROUP BY t.category ORDER BY total DESC''',
+      [
+        TransactionKind.expense.name,
+        period.start.millisecondsSinceEpoch,
+        period.end.millisecondsSinceEpoch,
+      ],
     );
     return rows
         .map((row) => (row['category'] as String, (row['total'] as int?) ?? 0))
         .toList();
+  }
+
+  /// Budget-counted spend for each calendar day inside [period], keyed by the
+  /// day's midnight timestamp so days with no spend can still show a bar.
+  Future<Map<DateTime, int>> dailySpend(BudgetPeriod period) async {
+    final rows = await (await _db).rawQuery(
+      '''SELECT t.occurred_at AS at, t.amount_minor AS amount FROM transactions t
+         JOIN accounts a ON a.id = t.account_id
+         WHERE t.kind = ? AND t.exclude_from_budget = 0 AND a.in_budget = 1
+           AND t.occurred_at >= ? AND t.occurred_at < ?''',
+      [
+        TransactionKind.expense.name,
+        period.start.millisecondsSinceEpoch,
+        period.end.millisecondsSinceEpoch,
+      ],
+    );
+    final byDay = <DateTime, int>{};
+    for (final row in rows) {
+      final at = DateTime.fromMillisecondsSinceEpoch(row['at'] as int);
+      final day = DateTime(at.year, at.month, at.day);
+      byDay[day] = (byDay[day] ?? 0) + (row['amount'] as int? ?? 0);
+    }
+    return byDay;
   }
 
   /// Seeds the fixed category list so the budget screen has rows to show even

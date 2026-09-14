@@ -22,6 +22,8 @@ class TallyTransaction {
     this.balanceAfterMinor,
     this.categorySource = CategorySource.manual,
     this.needsReview = false,
+    this.excludeFromBudget = false,
+    this.transferAccountId,
   });
 
   final int? id;
@@ -52,6 +54,14 @@ class TallyTransaction {
   /// True when the category is a low-confidence guess and worth confirming.
   final bool needsReview;
 
+  /// True when this row should not count toward the budget, regardless of
+  /// kind or account (manually flagged, or a self transfer).
+  final bool excludeFromBudget;
+
+  /// Destination account for a [TransactionKind.transfer] row; [accountId] is
+  /// the source. Null for every other kind.
+  final int? transferAccountId;
+
   /// Signed effect on a balance. Transfers between tracked accounts net out at
   /// the portfolio level, so they contribute nothing.
   int get signedMinor => switch (kind) {
@@ -64,19 +74,26 @@ class TallyTransaction {
 
   TallyTransaction copyWith({
     int? id,
+    int? amountMinor,
+    TransactionKind? kind,
+    DateTime? occurredAt,
     String? category,
     String? merchant,
+    String? note,
     int? accountId,
     CategorySource? categorySource,
     bool? needsReview,
+    bool? excludeFromBudget,
+    int? transferAccountId,
+    bool clearTransferAccount = false,
   }) => TallyTransaction(
     id: id ?? this.id,
-    amountMinor: amountMinor,
-    kind: kind,
-    occurredAt: occurredAt,
+    amountMinor: amountMinor ?? this.amountMinor,
+    kind: kind ?? this.kind,
+    occurredAt: occurredAt ?? this.occurredAt,
     merchant: merchant ?? this.merchant,
     category: category ?? this.category,
-    note: note,
+    note: note ?? this.note,
     source: source,
     fingerprint: fingerprint,
     accountId: accountId ?? this.accountId,
@@ -84,6 +101,10 @@ class TallyTransaction {
     balanceAfterMinor: balanceAfterMinor,
     categorySource: categorySource ?? this.categorySource,
     needsReview: needsReview ?? this.needsReview,
+    excludeFromBudget: excludeFromBudget ?? this.excludeFromBudget,
+    transferAccountId: clearTransferAccount
+        ? null
+        : (transferAccountId ?? this.transferAccountId),
   );
 
   Map<String, Object?> toMap() => {
@@ -101,6 +122,8 @@ class TallyTransaction {
     'balance_after_minor': balanceAfterMinor,
     'category_source': categorySource.name,
     'needs_review': needsReview ? 1 : 0,
+    'exclude_from_budget': excludeFromBudget ? 1 : 0,
+    'transfer_account_id': transferAccountId,
   };
 
   factory TallyTransaction.fromMap(Map<String, Object?> map) =>
@@ -127,5 +150,7 @@ class TallyTransaction {
           orElse: () => CategorySource.manual,
         ),
         needsReview: (map['needs_review'] as int?) == 1,
+        excludeFromBudget: (map['exclude_from_budget'] as int?) == 1,
+        transferAccountId: map['transfer_account_id'] as int?,
       );
 }
