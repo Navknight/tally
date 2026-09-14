@@ -54,8 +54,10 @@ String _majorUnits(int minor) {
 
 String _csvLine(List<String> fields) => fields.map(_csvField).join(',');
 
+final _csvSpecialCharsRegex = RegExp('[,"\n\r]');
+
 String _csvField(String value) {
-  final needsQuoting = value.contains(RegExp('[,"\n\r]'));
+  final needsQuoting = value.contains(_csvSpecialCharsRegex);
   if (!needsQuoting) return value;
   return '"${value.replaceAll('"', '""')}"';
 }

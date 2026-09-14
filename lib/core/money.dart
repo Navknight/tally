@@ -1,3 +1,5 @@
+final _nonDigitRegex = RegExp(r'[^0-9.]');
+
 /// Formats integer minor units for display. Indian digit grouping is used for
 /// the rupee (1,23,456.00) and three-digit grouping for everything else.
 String money(int minor, String symbol) {
@@ -40,7 +42,7 @@ int? parseMoney(String value) {
       (text.startsWith('(') && text.endsWith(')')) ||
       lower.endsWith('dr');
   if (lower.endsWith('cr')) negative = false;
-  final digits = text.replaceAll(RegExp(r'[^0-9.]'), '');
+  final digits = text.replaceAll(_nonDigitRegex, '');
   if (digits.isEmpty) return null;
   // A statement may carry a stray second dot ("1.234.50"); keep the last one
   // as the decimal separator and treat earlier ones as grouping.

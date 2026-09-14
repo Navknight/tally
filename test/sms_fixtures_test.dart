@@ -70,6 +70,20 @@ void main() {
       expect(outcome.last4, '3001');
       expect(outcome.merchant, 'Amazon Pay Indi');
       expect(outcome.balanceAfterMinor, isNull);
+      expect(outcome.isCard, isTrue);
+    });
+
+    test('a plain bank account debit is not flagged as a card', () {
+      final outcome =
+          parseBankSms(
+                sender: 'JK-CBSSBI-S',
+                body:
+                    'Dear Customer, Your A/C XXXXX123456 has a debit by '
+                    'NACH of Rs 100.00 on 14/09/26. Avl Bal Rs 3,00,340.48. '
+                    'Download YONO - SBI',
+              )
+              as SmsTransaction;
+      expect(outcome.isCard, isFalse);
     });
 
     test('transfer-out merchant stops at ". Avl" and drops the honorific', () {

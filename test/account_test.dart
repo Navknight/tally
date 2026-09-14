@@ -56,6 +56,49 @@ void main() {
     expect(accountBalance(account, transactions), 48000);
   });
 
+  test('totalBalance excludes card accounts entirely', () {
+    const bank = Account(id: 1, name: 'A', last4: '', openingBalanceMinor: 1000);
+    const card = Account(
+      id: 2,
+      name: 'Card',
+      last4: '',
+      openingBalanceMinor: 500,
+      kind: AccountKind.card,
+    );
+    final transactions = [
+      _tx(200, TransactionKind.expense, accountId: 2), // spend on the card
+    ];
+    expect(totalBalance([bank, card], transactions), 1000);
+  });
+
+  test('last4Matches is a suffix match either direction, never on empty', () {
+    expect(last4Matches('3001', '3001'), isTrue);
+    expect(last4Matches('XX3001', '3001'), isTrue);
+    expect(last4Matches('3001', 'XX3001'), isTrue);
+    expect(last4Matches('3001', '4002'), isFalse);
+    expect(last4Matches('', ''), isFalse);
+    expect(last4Matches('', '3001'), isFalse);
+  });
+
+  test('matchesForClaim requires last4 to match and bank not to conflict', () {
+    expect(
+      matchesForClaim(rowLast4: '3001', rowBank: 'ICICI', last4: '3001', bank: 'ICICI'),
+      isTrue,
+    );
+    expect(
+      matchesForClaim(rowLast4: '3001', rowBank: null, last4: '3001', bank: 'ICICI'),
+      isTrue,
+    );
+    expect(
+      matchesForClaim(rowLast4: '3001', rowBank: 'SBI', last4: '3001', bank: 'ICICI'),
+      isFalse,
+    );
+    expect(
+      matchesForClaim(rowLast4: '4002', rowBank: 'ICICI', last4: '3001', bank: 'ICICI'),
+      isFalse,
+    );
+  });
+
   test('totalBalance ignores transactions that matched no account', () {
     const a = Account(id: 1, name: 'A', last4: '', openingBalanceMinor: 1000);
     const b = Account(id: 2, name: 'B', last4: '', openingBalanceMinor: 500);

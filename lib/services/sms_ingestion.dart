@@ -1,3 +1,7 @@
+import 'dart:isolate';
+
+import 'package:flutter/foundation.dart';
+
 import '../core/hash.dart';
 import '../data/tally_database.dart';
 import '../models/account.dart';
@@ -18,6 +22,7 @@ class IngestReport {
     this.ignored = 0,
     this.balanceUpdates = 0,
     this.needsReview = 0,
+    this.failed = 0,
   });
 
   final int inserted;
@@ -25,6 +30,10 @@ class IngestReport {
   final int ignored;
   final int balanceUpdates;
   final int needsReview;
+
+  /// Messages that raised while being parsed or stored; never surfaced as a
+  /// crash, only counted so the snackbar can say something was wrong.
+  final int failed;
 
   int get considered => inserted + duplicates + ignored + balanceUpdates;
 
@@ -34,20 +43,32 @@ class IngestReport {
     int ignored = 0,
     int balanceUpdates = 0,
     int needsReview = 0,
+    int failed = 0,
   }) => IngestReport(
     inserted: this.inserted + inserted,
     duplicates: this.duplicates + duplicates,
     ignored: this.ignored + ignored,
     balanceUpdates: this.balanceUpdates + balanceUpdates,
     needsReview: this.needsReview + needsReview,
+    failed: this.failed + failed,
   );
 }
 
+/// Progress of a running ingestion pass, for a thin progress bar on the shell.
+/// Null when nothing is running.
+class SyncStatus {
+  const SyncStatus(this.done, this.total);
+  final int done;
+  final int total;
+}
+
+final ValueNotifier<SyncStatus?> smsSyncStatus = ValueNotifier(null);
+
 /// Identity of an imported message.
 ///
-/// The timestamp is deliberately excluded: the same SMS reaches us with the
-/// SMSC timestamp through the broadcast receiver and with the device timestamp
-/// through the provider scan, so folding time in would re-import every historic
+/// The timestamp is deliberately excluded: the SMS provider hands back a
+/// different timestamp for a live-received message than a later inbox scan
+/// of the same row would, so folding time in would re-import every historic
 /// row as a duplicate.
 String smsFingerprint({
   required String sender,
@@ -83,77 +104,157 @@ TallyTransaction buildTransaction({
   balanceAfterMinor: parsed.balanceAfterMinor,
   categorySource: categorySource,
   needsReview: needsReview,
+  accountLast4: parsed.last4,
+  bank: parsed.bank,
+  smsBody: message.body,
+  smsSender: message.sender,
 );
 
-/// Parses, categorises and stores a batch of messages, skipping anything
-/// already held and anything that is not a transaction.
-Future<IngestReport> ingestSms(Iterable<BankSms> messages) async {
-  final db = TallyDatabase.instance;
-  final categorizer = Categorizer(db);
-  final accounts = await db.accounts();
-  var report = const IngestReport();
+/// One message run through [parseBankSms], with its fingerprint precomputed
+/// when it turned out to be a transaction. Kept pure so the whole batch can be
+/// produced on a background isolate.
+class _Parsed {
+  const _Parsed(this.message, this.outcome);
+  final BankSms message;
+  final SmsOutcome outcome;
+}
 
-  for (final message in messages) {
-    final outcome = parseBankSms(sender: message.sender, body: message.body);
-    switch (outcome) {
-      case SmsIgnored():
-        report = report.plus(ignored: 1);
-      case SmsBalance(:final balanceMinor, :final last4):
-        final account = _match(accounts, last4);
-        if (account?.id == null) {
-          report = report.plus(ignored: 1);
-          continue;
-        }
-        await db.recordReportedBalance(
-          account!.id!,
-          balanceMinor,
-          message.timestamp,
-        );
-        report = report.plus(balanceUpdates: 1);
-      case SmsTransaction():
-        final account = _match(accounts, outcome.last4);
-        final guess = await _categorise(categorizer, outcome, message);
-        final row = buildTransaction(
-          parsed: outcome,
-          message: message,
-          category: guess.category,
-          categorySource: CategorySource.learned,
-          needsReview: guess.needsReview,
-          accountId: account?.id,
-        );
-        if (!await db.add(row)) {
-          report = report.plus(duplicates: 1);
-          continue;
-        }
-        report = report.plus(
-          inserted: 1,
-          needsReview: guess.needsReview ? 1 : 0,
-        );
-        if (outcome.balanceAfterMinor != null && account?.id != null)
-          await db.recordReportedBalance(
-            account!.id!,
-            outcome.balanceAfterMinor!,
-            message.timestamp,
-          );
+List<_Parsed> _parseBatch(List<BankSms> messages) => [
+  for (final m in messages)
+    _Parsed(m, parseBankSms(sender: m.sender, body: m.body)),
+];
+
+/// Parses, categorises and stores a batch of messages, skipping anything
+/// already held and anything that is not a transaction. Never throws: a
+/// message that fails to parse or store is counted in [IngestReport.failed]
+/// and logged, not surfaced as a crash.
+Future<IngestReport> ingestSms(Iterable<BankSms> messages) async {
+  final list = messages.toList(growable: false);
+  if (list.isEmpty) return const IngestReport();
+  smsSyncStatus.value = SyncStatus(0, list.length);
+  try {
+    final db = TallyDatabase.instance;
+    final categorizer = Categorizer(db);
+    final accounts = await db.accounts();
+
+    // Parsing is pure regex work with no DB access, so it runs off the main
+    // isolate; only the categoriser/DB phase below needs the main isolate.
+    final parsed = list.length > 20
+        ? await Isolate.run(() => _parseBatch(list))
+        : _parseBatch(list);
+
+    // Batch the categoriser lookup: one query for every distinct token in
+    // the whole batch instead of one per token per message.
+    final spendItems = <int>[]; // index into `parsed` needing a real guess
+    for (var i = 0; i < parsed.length; i++) {
+      final outcome = parsed[i].outcome;
+      if (outcome is SmsTransaction && outcome.kind != TransactionKind.transfer)
+        spendItems.add(i);
     }
+    final guesses = await categorizer.guessMany([
+      for (final i in spendItems)
+        (
+          merchant: (parsed[i].outcome as SmsTransaction).merchant,
+          body: parsed[i].message.body,
+        ),
+    ]);
+    final guessByIndex = {
+      for (var j = 0; j < spendItems.length; j++) spendItems[j]: guesses[j],
+    };
+
+    var report = const IngestReport();
+    final rows = <TallyTransaction>[];
+    final balanceUpdates = <(int, int, DateTime)>[];
+    final detections = <(String bank, String last4, AccountKind kind, int? bal, DateTime at)>[];
+
+    for (var i = 0; i < parsed.length; i++) {
+      final message = parsed[i].message;
+      final outcome = parsed[i].outcome;
+      switch (outcome) {
+        case SmsIgnored():
+          report = report.plus(ignored: 1);
+        case SmsBalance(:final balanceMinor, :final last4, :final bank, :final isCard):
+          final account = _match(accounts, last4);
+          if (account?.id == null) {
+            if (last4 != null && last4.isNotEmpty)
+              detections.add((
+                bank,
+                last4,
+                isCard ? AccountKind.card : AccountKind.bank,
+                balanceMinor,
+                message.timestamp,
+              ));
+            report = report.plus(ignored: 1);
+            continue;
+          }
+          balanceUpdates.add((account!.id!, balanceMinor, message.timestamp));
+          report = report.plus(balanceUpdates: 1);
+        case SmsTransaction():
+          final account = _match(accounts, outcome.last4);
+          if (account?.id == null &&
+              outcome.last4 != null &&
+              outcome.last4!.isNotEmpty)
+            detections.add((
+              outcome.bank,
+              outcome.last4!,
+              outcome.isCard ? AccountKind.card : AccountKind.bank,
+              outcome.balanceAfterMinor,
+              message.timestamp,
+            ));
+          final guess = outcome.kind == TransactionKind.transfer
+              ? const CategoryGuess('Transfers', 1)
+              : _resolveIncomeGuess(outcome, guessByIndex[i]!);
+          rows.add(
+            buildTransaction(
+              parsed: outcome,
+              message: message,
+              category: guess.category,
+              categorySource: CategorySource.learned,
+              needsReview: guess.needsReview,
+              accountId: account?.id,
+            ),
+          );
+          if (outcome.balanceAfterMinor != null && account?.id != null)
+            balanceUpdates.add((
+              account!.id!,
+              outcome.balanceAfterMinor!,
+              message.timestamp,
+            ));
+      }
+      if ((i + 1) % 50 == 0 || i == parsed.length - 1)
+        smsSyncStatus.value = SyncStatus(i + 1, parsed.length);
+    }
+
+    final inserted = await db.storeIngestBatch(
+      rows: rows,
+      balanceUpdates: balanceUpdates,
+    );
+    report = report.plus(
+      inserted: inserted,
+      duplicates: rows.length - inserted,
+      needsReview: rows.where((r) => r.needsReview).length,
+    );
+    for (final d in detections)
+      await db.upsertDetection(
+        bank: d.$1,
+        last4: d.$2,
+        kind: d.$3,
+        balanceMinor: d.$4,
+        at: d.$5,
+      );
+    await db.linkSelfTransfers();
+    return report;
+  } catch (e, st) {
+    debugPrint('ingestSms failed: $e\n$st');
+    return IngestReport(failed: list.length);
+  } finally {
+    smsSyncStatus.value = null;
   }
-  await db.linkSelfTransfers();
-  return report;
 }
 
 /// Money coming in is income by definition, so it never needs review — only
 /// spending has a category worth guessing.
-Future<CategoryGuess> _categorise(
-  Categorizer categorizer,
-  SmsTransaction parsed,
-  BankSms message,
-) async {
-  if (parsed.kind == TransactionKind.transfer)
-    return const CategoryGuess('Transfers', 1);
-  final guess = await categorizer.guess(
-    merchant: parsed.merchant,
-    body: message.body,
-  );
+CategoryGuess _resolveIncomeGuess(SmsTransaction parsed, CategoryGuess guess) {
   if (parsed.kind == TransactionKind.income && guess.needsReview)
     return const CategoryGuess('Income', 1);
   return guess;
@@ -162,8 +263,7 @@ Future<CategoryGuess> _categorise(
 Account? _match(List<Account> accounts, String? last4) {
   if (last4 != null && last4.isNotEmpty) {
     for (final account in accounts)
-      if (account.last4.isNotEmpty &&
-          (last4.endsWith(account.last4) || account.last4.endsWith(last4)))
+      if (account.last4.isNotEmpty && last4Matches(last4, account.last4))
         return account;
     // Digits that match nothing are usually a credit card or another bank.
     // Only a lone account with no digits entered can safely claim them.
@@ -174,14 +274,89 @@ Account? _match(List<Account> accounts, String? last4) {
   return accounts.length == 1 ? accounts.single : null;
 }
 
-/// Drains whatever the broadcast receiver has queued since the app was last
-/// foregrounded.
-Future<IngestReport> ingestPendingSms() async =>
-    ingestSms(await AndroidBridge.pendingSms());
+/// Reads whatever the SMS provider has newer than the last watermark, then
+/// advances it. Called on resume and at startup once permission is granted.
+Future<IngestReport> ingestNewSms() async {
+  final db = TallyDatabase.instance;
+  final since = int.tryParse(await db.setting('sms_last_seen') ?? '0') ?? 0;
+  final messages = await AndroidBridge.smsSince(since);
+  final report = await ingestSms(messages);
+  final watermark = nextWatermark(since, messages);
+  if (watermark != since)
+    await db.setSetting('sms_last_seen', '$watermark');
+  return report;
+}
 
-/// One-shot consent-gated scan of the local SMS inbox.
-Future<IngestReport> ingestHistoricSms() async =>
-    ingestSms(await AndroidBridge.historicSms());
+/// The new watermark after reading [messages] that arrived since
+/// [currentWatermark]: the latest message timestamp seen, or the same
+/// watermark when nothing came back. Pure, so the "did we move forward"
+/// logic is testable without the platform channel.
+int nextWatermark(int currentWatermark, Iterable<BankSms> messages) =>
+    messages.fold(
+      currentWatermark,
+      (max, m) => m.timestamp.millisecondsSinceEpoch > max
+          ? m.timestamp.millisecondsSinceEpoch
+          : max,
+    );
+
+/// One-shot consent-gated scan of the entire local SMS inbox, used for the
+/// first "Scan SMS inbox" and to fully rebuild the watermark.
+Future<IngestReport> ingestHistoricSms() async {
+  final messages = await AndroidBridge.smsSince(0);
+  final report = await ingestSms(messages);
+  final watermark = nextWatermark(0, messages);
+  await TallyDatabase.instance.setSetting('sms_last_seen', '$watermark');
+  return report;
+}
+
+/// Re-parses every stored SMS transaction against its saved message text,
+/// so a parser fix corrects history without re-reading the inbox. Manual
+/// category/account edits are kept; only fields [parseBankSms] fills in are
+/// refreshed. Rows saved before this field existed have no stored body and
+/// fall back to a full inbox re-read.
+Future<IngestReport> rereadStoredSms() async {
+  final db = TallyDatabase.instance;
+  final rows = await db.smsTransactions();
+  final withBody = <TallyTransaction>[];
+  final withoutBody = <TallyTransaction>[];
+  for (final row in rows)
+    ((row.smsBody ?? '').isEmpty ? withoutBody : withBody).add(row);
+
+  var reparsed = 0;
+  var failed = 0;
+  for (final row in withBody) {
+    try {
+      final outcome = parseBankSms(
+        sender: row.smsSender ?? '',
+        body: row.smsBody!,
+      );
+      if (outcome is! SmsTransaction) continue;
+      // A manually confirmed category was set while looking at this
+      // merchant text, so leave it (and the label) exactly as the user saw
+      // it; the account link is likewise never touched by a re-read.
+      final keepMerchant = row.categorySource == CategorySource.manual;
+      await db.updateTransaction(
+        row.copyWith(
+          amountMinor: outcome.amountMinor,
+          kind: outcome.kind,
+          merchant: keepMerchant ? row.merchant : outcome.merchant,
+        ),
+      );
+      reparsed++;
+    } catch (e, st) {
+      debugPrint('rereadStoredSms failed for #${row.id}: $e\n$st');
+      failed++;
+    }
+  }
+
+  var report = IngestReport(inserted: reparsed, failed: failed);
+  if (withoutBody.isNotEmpty) {
+    await db.deleteByIds(withoutBody.map((r) => r.id!).toList());
+    report = report.plus(inserted: (await ingestHistoricSms()).inserted);
+  }
+  await db.linkSelfTransfers();
+  return report;
+}
 
 /// Re-runs the categoriser over rows still marked for review, which is what
 /// makes earlier transactions benefit from later corrections.

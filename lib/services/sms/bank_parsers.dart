@@ -120,10 +120,15 @@ const _creditWords = [
   'cr',
 ];
 
-int? _earliestIndex(String lower, List<String> words) {
+final _debitWordRegexes = [for (final w in _debitWords) RegExp(r'\b' + w + r'\b')];
+final _creditWordRegexes = [
+  for (final w in _creditWords) RegExp(r'\b' + w + r'\b'),
+];
+
+int? _earliestIndex(String lower, List<RegExp> wordRegexes) {
   int? best;
-  for (final word in words) {
-    final match = RegExp(r'\b' + word + r'\b').firstMatch(lower);
+  for (final regex in wordRegexes) {
+    final match = regex.firstMatch(lower);
     if (match != null && (best == null || match.start < best))
       best = match.start;
   }
@@ -159,8 +164,8 @@ class GenericIndianBankParser extends BankParser {
     if (transferWording)
       return selfTransfer ? TransactionKind.transfer : TransactionKind.expense;
 
-    final debitIdx = _earliestIndex(lower, _debitWords);
-    final creditIdx = _earliestIndex(lower, _creditWords);
+    final debitIdx = _earliestIndex(lower, _debitWordRegexes);
+    final creditIdx = _earliestIndex(lower, _creditWordRegexes);
     if (debitIdx == null && creditIdx == null) return null;
     if (debitIdx != null && (creditIdx == null || debitIdx <= creditIdx))
       return TransactionKind.expense;
@@ -193,7 +198,7 @@ class GenericIndianBankParser extends BankParser {
     // 1. UPI VPA, skipping a handle that is really a phone number.
     for (final match in _vpaRegex.allMatches(body)) {
       final handle = match.group(1)!;
-      if (RegExp(r'^\d+$').hasMatch(handle)) continue;
+      if (_allDigitsRegex.hasMatch(handle)) continue;
       return _cleanMerchant(handle, bank);
     }
 
@@ -204,7 +209,7 @@ class GenericIndianBankParser extends BankParser {
       for (final segment in segments.reversed) {
         final trimmed = segment.trim();
         if (trimmed.isEmpty) continue;
-        if (RegExp(r'^\d+$').hasMatch(trimmed)) continue;
+        if (_allDigitsRegex.hasMatch(trimmed)) continue;
         if (trimmed.toUpperCase() == 'UPI') continue;
         return _cleanMerchant(trimmed, bank);
       }
@@ -224,7 +229,7 @@ class GenericIndianBankParser extends BankParser {
     // charclass above) or the account line itself ("your A/C ...").
     for (final match in _atToRegex.allMatches(body)) {
       final candidate = match.group(1)!.trim();
-      if (RegExp(r'^\d+$').hasMatch(candidate)) continue;
+      if (_allDigitsRegex.hasMatch(candidate)) continue;
       if (_looksLikeAccountLine(candidate)) continue;
       return _cleanMerchant(candidate, bank);
     }
@@ -233,7 +238,7 @@ class GenericIndianBankParser extends BankParser {
     // nothing so "Sent ... From <bank> To <payee>" still prefers the payee.
     for (final match in _fromRegex.allMatches(body)) {
       final candidate = match.group(1)!.trim();
-      if (RegExp(r'^\d+$').hasMatch(candidate)) continue;
+      if (_allDigitsRegex.hasMatch(candidate)) continue;
       if (_looksLikeAccountLine(candidate)) continue;
       return _cleanMerchant(candidate, bank);
     }
@@ -243,8 +248,12 @@ class GenericIndianBankParser extends BankParser {
   }
 }
 
+final _allDigitsRegex = RegExp(r'^\d+$');
+
+final _accountLineRegex = RegExp(r'^your\s+a(/c|ccount)\b', caseSensitive: false);
+
 bool _looksLikeAccountLine(String candidate) =>
-    RegExp(r'^your\s+a(/c|ccount)\b', caseSensitive: false).hasMatch(candidate);
+    _accountLineRegex.hasMatch(candidate);
 
 /// Where a merchant clause runs into the next clause of the SMS - an account
 /// reference, a date, a reference number - rather than actually ending.
@@ -253,23 +262,29 @@ final _merchantStopRegex = RegExp(
   caseSensitive: false,
 );
 
+final _vpaPrefixRegex = RegExp(r'^vpa\s+', caseSensitive: false);
+final _onDateSuffixRegex = RegExp(r'\s+on\s+\d.*$', caseSensitive: false);
+final _refSuffixRegex = RegExp(r'\s+ref\S*.*$', caseSensitive: false);
+final _viaSuffixRegex = RegExp(r'\s+via\s.*$', caseSensitive: false);
+final _honorificRegex = RegExp(r'^(mr|mrs|ms)\.?\s+', caseSensitive: false);
+final _trailingDigitsRegex = RegExp(r'(\s+\d+)+$');
+final _trailingPunctuationRegex = RegExp(r'[.;\-\s]+$');
+final _collapseWhitespaceRegex = RegExp(r'\s+');
+
 String _cleanMerchant(String raw, String bank) {
   var text = raw.trim();
-  text = text.replaceFirst(RegExp(r'^vpa\s+', caseSensitive: false), '');
+  text = text.replaceFirst(_vpaPrefixRegex, '');
   final stopMatch = _merchantStopRegex.firstMatch(text);
   if (stopMatch != null) text = text.substring(0, stopMatch.start);
-  text = text.replaceFirst(RegExp(r'\s+on\s+\d.*$', caseSensitive: false), '');
-  text = text.replaceFirst(RegExp(r'\s+ref\S*.*$', caseSensitive: false), '');
-  text = text.replaceFirst(RegExp(r'\s+via\s.*$', caseSensitive: false), '');
-  text = text.replaceFirst(
-    RegExp(r'^(mr|mrs|ms)\.?\s+', caseSensitive: false),
-    '',
-  );
+  text = text.replaceFirst(_onDateSuffixRegex, '');
+  text = text.replaceFirst(_refSuffixRegex, '');
+  text = text.replaceFirst(_viaSuffixRegex, '');
+  text = text.replaceFirst(_honorificRegex, '');
   // Trailing reference-number fragments left over after a stop cut, e.g.
   // "Cbdt Tin 2 0" from "...To CBDT TIN 2 0 On 28/07/26...".
-  text = text.replaceFirst(RegExp(r'(\s+\d+)+$'), '');
-  text = text.replaceFirst(RegExp(r'[.;\-\s]+$'), '');
-  text = text.replaceAll(RegExp(r'\s+'), ' ').trim();
+  text = text.replaceFirst(_trailingDigitsRegex, '');
+  text = text.replaceFirst(_trailingPunctuationRegex, '');
+  text = text.replaceAll(_collapseWhitespaceRegex, ' ').trim();
   if (text.isEmpty) return '$bank transaction';
   // Bank SMS wording is a mix of ALL CAPS and Title Case with no signal
   // worth preserving either way, so every merchant is normalised the same.

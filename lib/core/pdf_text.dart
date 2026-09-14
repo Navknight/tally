@@ -60,15 +60,18 @@ String? extractPdfText(Uint8List bytes) {
   }
 
   final text = out.toString();
-  if (!RegExp(r'[A-Za-z0-9]').hasMatch(text)) return null;
+  if (!_alphanumericRegex.hasMatch(text)) return null;
   return text;
 }
+
+final _alphanumericRegex = RegExp(r'[A-Za-z0-9]');
+final _octalDigitRegex = RegExp(r'[0-7]');
 
 /// True when [op] appears at [i] in [s] as a standalone operator token
 /// (not part of a longer identifier).
 bool _isOperatorAt(String s, int i, String op) {
   if (!s.startsWith(op, i)) return false;
-  bool isWordChar(String c) => RegExp(r'[A-Za-z0-9]').hasMatch(c);
+  bool isWordChar(String c) => _alphanumericRegex.hasMatch(c);
   final before = i == 0 ? ' ' : s[i - 1];
   final afterIdx = i + op.length;
   final after = afterIdx >= s.length ? ' ' : s[afterIdx];
@@ -107,10 +110,10 @@ String _textFromContentStream(String s) {
           } else if (next == 't') {
             sb.write('\t');
             i += 2;
-          } else if (RegExp(r'[0-7]').hasMatch(next)) {
+          } else if (_octalDigitRegex.hasMatch(next)) {
             var j = i + 1;
             var oct = '';
-            while (j < n && oct.length < 3 && RegExp(r'[0-7]').hasMatch(s[j])) {
+            while (j < n && oct.length < 3 && _octalDigitRegex.hasMatch(s[j])) {
               oct += s[j];
               j++;
             }

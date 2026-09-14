@@ -14,6 +14,7 @@ class SmsTransaction extends SmsOutcome {
     this.reference,
     this.balanceAfterMinor,
     required this.bank,
+    this.isCard = false,
   });
   final int amountMinor;
   final TransactionKind kind;
@@ -22,14 +23,24 @@ class SmsTransaction extends SmsOutcome {
   final String? reference; // UPI ref / UTR / txn id
   final int? balanceAfterMinor; // running balance stated in the same message
   final String bank;
+
+  /// True when [last4] names a card ("Card XX3001", "Credit Card") rather
+  /// than a bank account, so a detection can be typed correctly.
+  final bool isCard;
 }
 
 /// Message stated a balance but no transaction (e.g. a balance enquiry alert).
 class SmsBalance extends SmsOutcome {
-  SmsBalance({required this.balanceMinor, this.last4, required this.bank});
+  SmsBalance({
+    required this.balanceMinor,
+    this.last4,
+    required this.bank,
+    this.isCard = false,
+  });
   final int balanceMinor;
   final String? last4;
   final String bank;
+  final bool isCard;
 }
 
 /// Not a ledger event. [reason] says why.
@@ -71,10 +82,16 @@ abstract class BankParser {
     final kind = extractKind(body);
     final balance = extractBalance(body);
     final last4 = extractLast4(body);
+    final isCard = _cardRegex.hasMatch(body);
 
     if (amount == null || kind == null) {
       if (balance != null)
-        return SmsBalance(balanceMinor: balance, last4: last4, bank: bank);
+        return SmsBalance(
+          balanceMinor: balance,
+          last4: last4,
+          bank: bank,
+          isCard: isCard,
+        );
       return SmsIgnored(MessageClass.personal);
     }
 
@@ -86,6 +103,11 @@ abstract class BankParser {
       reference: extractReference(body),
       balanceAfterMinor: balance,
       bank: bank,
+      isCard: isCard,
     );
   }
 }
+
+/// Wording that names a card rather than a bank account: "Card XX3001",
+/// "Credit Card", "spent using ... Card".
+final _cardRegex = RegExp(r'\bcard\b|spent using', caseSensitive: false);

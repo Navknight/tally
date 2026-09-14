@@ -37,17 +37,25 @@ bool isSelfTransferPair(TallyTransaction debit, TallyTransaction credit) {
 /// Scans [rows] for self-transfer pairs, matching each debit to at most one
 /// credit (the closest in time), each credit used at most once.
 ///
-// ponytail: O(n^2) scan; fine for one device's transaction history, revisit
-// with a time-bucketed index if a ledger ever runs into the tens of thousands.
+/// Credits are sorted by time once, so each debit only scans the ±30 minute
+/// window around it instead of every credit in the ledger.
 List<TransferMatch> findSelfTransfers(List<TallyTransaction> rows) {
+  final credits =
+      rows.where((t) => t.kind == TransactionKind.income && t.id != null).toList()
+        ..sort((a, b) => a.occurredAt.compareTo(b.occurredAt));
   final matches = <TransferMatch>[];
   final usedCredits = <int>{};
   for (final debit in rows) {
     if (debit.kind != TransactionKind.expense) continue;
+    final low = debit.occurredAt.subtract(_window);
+    final high = debit.occurredAt.add(_window);
+    var start = _lowerBound(credits, low);
     TallyTransaction? best;
     Duration? bestDiff;
-    for (final credit in rows) {
-      if (credit.id == null || usedCredits.contains(credit.id)) continue;
+    for (var i = start; i < credits.length; i++) {
+      final credit = credits[i];
+      if (credit.occurredAt.isAfter(high)) break;
+      if (usedCredits.contains(credit.id)) continue;
       if (!isSelfTransferPair(debit, credit)) continue;
       final diff = debit.occurredAt.difference(credit.occurredAt).abs();
       if (bestDiff == null || diff < bestDiff) {
@@ -61,4 +69,18 @@ List<TransferMatch> findSelfTransfers(List<TallyTransaction> rows) {
     }
   }
   return matches;
+}
+
+/// Index of the first entry in [sorted] (ascending by [TallyTransaction.occurredAt])
+/// whose time is not before [at].
+int _lowerBound(List<TallyTransaction> sorted, DateTime at) {
+  var lo = 0, hi = sorted.length;
+  while (lo < hi) {
+    final mid = (lo + hi) >> 1;
+    if (sorted[mid].occurredAt.isBefore(at))
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return lo;
 }

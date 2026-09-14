@@ -11,6 +11,9 @@ abstract class CategoryStore {
   /// category -> times this token appeared in a labelled example.
   Future<Map<String, int>> tokenCounts(String token);
 
+  /// [tokenCounts] for many tokens in one round trip, keyed by token.
+  Future<Map<String, Map<String, int>>> tokenCountsBatch(List<String> tokens);
+
   /// category -> number of labelled examples.
   Future<Map<String, int>> categoryCounts();
   Future<void> train(List<String> tokens, String category);
@@ -167,6 +170,10 @@ const Set<String> _stopwords = {
   'by',
 };
 
+final _nonLetterRegex = RegExp(r'[^a-z\s]');
+final _whitespaceRegex = RegExp(r'\s+');
+final _nonLettersRegex = RegExp(r'[^a-z]+');
+
 class Categorizer {
   Categorizer(this.store, {this.threshold = 0.62, this.minExamples = 4});
   final CategoryStore store;
@@ -178,8 +185,8 @@ class Categorizer {
   /// and "Acme Mart" are the same merchant.
   static String merchantKey(String merchant) {
     final lower = merchant.toLowerCase();
-    final stripped = lower.replaceAll(RegExp(r'[^a-z\s]'), ' ');
-    return stripped.replaceAll(RegExp(r'\s+'), ' ').trim();
+    final stripped = lower.replaceAll(_nonLetterRegex, ' ');
+    return stripped.replaceAll(_whitespaceRegex, ' ').trim();
   }
 
   /// Tokens used for the Bayes layer: merchant + optional message body,
@@ -187,7 +194,7 @@ class Categorizer {
   /// de-duplicated.
   static List<String> tokenize(String merchant, [String body = '']) {
     final combined = '$merchant $body'.toLowerCase();
-    final raw = combined.split(RegExp(r'[^a-z]+'));
+    final raw = combined.split(_nonLettersRegex);
     final seen = <String>{};
     for (final token in raw) {
       if (token.length <= 1) continue;
@@ -205,18 +212,8 @@ class Categorizer {
     final learned = await store.merchantCategory(key);
     if (learned != null) return CategoryGuess(learned, 1.0);
 
-    final lowerMerchant = merchant.toLowerCase();
-    final lowerBody = body.toLowerCase();
-    for (final entry in _seedLexicon.entries) {
-      if (lowerMerchant.contains(entry.key)) {
-        return CategoryGuess(entry.value, 0.8);
-      }
-    }
-    for (final entry in _seedLexicon.entries) {
-      if (lowerBody.contains(entry.key)) {
-        return CategoryGuess(entry.value, 0.8);
-      }
-    }
+    final seeded = _seedGuess(merchant, body);
+    if (seeded != null) return seeded;
 
     final categoryCounts = await store.categoryCounts();
     final totalExamples = categoryCounts.values.fold<int>(0, (a, b) => a + b);
@@ -225,23 +222,84 @@ class Categorizer {
     }
 
     final tokens = tokenize(merchant, body);
-    final categories = categoryCounts.keys.toList();
-    // Precompute per-category token totals for smoothing denominator, and
-    // vocab size across categories seen for this token set.
     final tokenCountsByToken = <String, Map<String, int>>{};
     for (final t in tokens) {
       tokenCountsByToken[t] = await store.tokenCounts(t);
     }
+    return _bayesGuess(tokens, categoryCounts, totalExamples, tokenCountsByToken);
+  }
+
+  /// Same guess as [guess], for many transactions at once: the category and
+  /// token stats each message needs are fetched once up front instead of per
+  /// message, which is what makes a big SMS ingest batch cheap.
+  Future<List<CategoryGuess>> guessMany(
+    List<({String merchant, String body})> items,
+  ) async {
+    final categoryCounts = await store.categoryCounts();
+    final totalExamples = categoryCounts.values.fold<int>(0, (a, b) => a + b);
+    final tokenized = [for (final i in items) tokenize(i.merchant, i.body)];
+    final allTokens = <String>{for (final t in tokenized) ...t};
+    final tokenCountsByToken = await store.tokenCountsBatch(
+      allTokens.toList(),
+    );
+
+    final results = <CategoryGuess>[];
+    for (var i = 0; i < items.length; i++) {
+      final item = items[i];
+      final key = merchantKey(item.merchant);
+      final learned = await store.merchantCategory(key);
+      if (learned != null) {
+        results.add(CategoryGuess(learned, 1.0));
+        continue;
+      }
+      final seeded = _seedGuess(item.merchant, item.body);
+      if (seeded != null) {
+        results.add(seeded);
+        continue;
+      }
+      results.add(
+        totalExamples == 0
+            ? const CategoryGuess(kUncategorized, 0.0, needsReview: true)
+            : _bayesGuess(
+                tokenized[i],
+                categoryCounts,
+                totalExamples,
+                tokenCountsByToken,
+              ),
+      );
+    }
+    return results;
+  }
+
+  CategoryGuess? _seedGuess(String merchant, String body) {
+    final lowerMerchant = merchant.toLowerCase();
+    final lowerBody = body.toLowerCase();
+    for (final entry in _seedLexicon.entries)
+      if (lowerMerchant.contains(entry.key)) return CategoryGuess(entry.value, 0.8);
+    for (final entry in _seedLexicon.entries)
+      if (lowerBody.contains(entry.key)) return CategoryGuess(entry.value, 0.8);
+    return null;
+  }
+
+  CategoryGuess _bayesGuess(
+    List<String> tokens,
+    Map<String, int> categoryCounts,
+    int totalExamples,
+    Map<String, Map<String, int>> tokenCountsByToken,
+  ) {
+    final categories = categoryCounts.keys.toList();
+    final relevant = {
+      for (final t in tokens)
+        if (tokenCountsByToken.containsKey(t)) t: tokenCountsByToken[t]!,
+    };
     // Approximate vocabulary size: number of distinct tokens observed across
     // categories for the tokens we're scoring (a reasonable, cheap proxy).
-    final vocabSize = tokenCountsByToken.isEmpty
-        ? 1
-        : tokenCountsByToken.length;
+    final vocabSize = relevant.isEmpty ? 1 : relevant.length;
 
     final totalTokensPerCategory = <String, int>{};
     for (final cat in categories) {
       var sum = 0;
-      for (final counts in tokenCountsByToken.values) {
+      for (final counts in relevant.values) {
         sum += counts[cat] ?? 0;
       }
       totalTokensPerCategory[cat] = sum;
@@ -253,7 +311,7 @@ class Categorizer {
       var logScore = log(prior);
       final denom = totalTokensPerCategory[cat]! + vocabSize;
       for (final t in tokens) {
-        final count = tokenCountsByToken[t]?[cat] ?? 0;
+        final count = relevant[t]?[cat] ?? 0;
         logScore += log((count + 1) / denom);
       }
       logScores[cat] = logScore;

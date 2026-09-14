@@ -11,6 +11,7 @@ import 'data/tally_database.dart';
 import 'insights.dart';
 import 'models/account.dart';
 import 'models/categories.dart';
+import 'models/detected_account.dart';
 import 'models/transaction.dart';
 import 'platform/android_bridge.dart';
 import 'services/export.dart';
@@ -59,16 +60,20 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
     final done = await TallyDatabase.instance.setting('onboarded') == 'true';
     await TallyDatabase.instance.ensureCategorySeed();
     if (mounted) setState(() => _ready = done);
+    if (done) {
+      AndroidBridge.onSmsChanged(() => unawaited(_syncSms()));
+      unawaited(_syncSms());
+    }
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.resumed && _ready == true)
-      unawaited(_importPendingSms());
+      unawaited(_syncSms());
   }
 
-  Future<void> _importPendingSms() async {
-    final report = await ingestPendingSms();
+  Future<void> _syncSms() async {
+    final report = await ingestNewSms();
     if (report.considered == 0) return;
     await recategorizeReviewQueue();
     if (mounted) setState(() {});
@@ -226,30 +231,84 @@ class TallyShell extends StatefulWidget {
 class _TallyShellState extends State<TallyShell> {
   int _tab = 0;
   int _refresh = 0;
-  void _changed() => setState(() => _refresh++);
+  int _pagesBuiltFor = -1;
+  late List<Widget> _pages;
+
   @override
-  Widget build(BuildContext context) {
-    final pages = [
+  void initState() {
+    super.initState();
+    smsSyncStatus.addListener(_onSyncChanged);
+  }
+
+  @override
+  void dispose() {
+    smsSyncStatus.removeListener(_onSyncChanged);
+    super.dispose();
+  }
+
+  void _onSyncChanged() {
+    if (!mounted) return;
+    // A finished sync means new rows may have landed; rebuild the pages once
+    // it's done. While running, just repaint the progress bar.
+    if (smsSyncStatus.value == null)
+      _rebuildPages();
+    else
+      setState(() {});
+  }
+
+  void _rebuildPages() => setState(() => _refresh++);
+
+  /// Rebuilds the page list only when [_refresh] actually changed, so
+  /// switching tabs never re-runs a page's queries.
+  void _ensurePages() {
+    if (_pagesBuiltFor == _refresh) return;
+    _pagesBuiltFor = _refresh;
+    _pages = [
       HomeScreen(
         key: ValueKey(_refresh),
-        onChanged: _changed,
+        onChanged: _rebuildPages,
         onOpenInsights: () => setState(() => _tab = 3),
       ),
-      TransactionsScreen(key: ValueKey(_refresh), onChanged: _changed),
-      BudgetScreen(key: ValueKey(_refresh), onChanged: _changed),
-      InsightsScreen(key: ValueKey(_refresh), onChanged: _changed),
-      SettingsScreen(key: ValueKey(_refresh), onChanged: _changed),
+      TransactionsScreen(key: ValueKey(_refresh), onChanged: _rebuildPages),
+      BudgetScreen(key: ValueKey(_refresh), onChanged: _rebuildPages),
+      InsightsScreen(key: ValueKey(_refresh), onChanged: _rebuildPages),
+      SettingsScreen(key: ValueKey(_refresh), onChanged: _rebuildPages),
     ];
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    _ensurePages();
+    final status = smsSyncStatus.value;
     return PopScope(
       canPop: _tab == 0,
       onPopInvokedWithResult: (didPop, _) {
         if (!didPop) setState(() => _tab = 0);
       },
       child: Scaffold(
-        body: pages[_tab],
+        body: Column(
+          children: [
+            if (status != null) ...[
+              const LinearProgressIndicator(minHeight: 2),
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 6,
+                ),
+                child: Text(
+                  'Reading SMS · ${status.done} of ${status.total}',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+            ],
+            Expanded(
+              child: IndexedStack(index: _tab, children: _pages),
+            ),
+          ],
+        ),
         floatingActionButton: _tab < 2
             ? FloatingActionButton(
-                onPressed: () => showTransactionSheet(context, _changed),
+                onPressed: () => showTransactionSheet(context, _rebuildPages),
                 child: const Icon(Icons.add),
               )
             : null,
@@ -309,14 +368,15 @@ class HomeScreen extends StatelessWidget {
       final db = TallyDatabase.instance;
       final startDay = await db.budgetStartDay();
       final period = budgetPeriod(DateTime.now(), startDay);
-      // ponytail: loads every row to sum balances; move to SQL SUM if it drags.
       return Future.wait([
-        db.transactions(limit: -1),
+        db.transactions(limit: 6),
         db.accounts(),
         db.currency(),
         db.setting('monthly_budget'),
         db.reviewQueue(),
-        db.spentInPeriod(period),
+        db.spentInPeriodSql(period),
+        db.accountBalancesSql(),
+        db.detectedAccounts(),
       ]);
     }(),
     builder: (context, snapshot) {
@@ -329,11 +389,17 @@ class HomeScreen extends StatelessWidget {
       final budget = int.tryParse(values[3] as String? ?? '0') ?? 0;
       final review = values[4] as List<TallyTransaction>;
       final spent = values[5] as int;
-      final balance = totalBalance(accounts, tx);
+      final balances = values[6] as Map<int, int>;
+      final detections = values[7] as List<DetectedAccount>;
+      final balance = accounts
+          .where((a) => a.kind == AccountKind.bank)
+          .fold<int>(0, (sum, a) => sum + (balances[a.id] ?? 0));
       final scheme = Theme.of(context).colorScheme;
       final lowAccounts = accounts.where((a) {
         final min = a.minBalanceMinor;
-        return min != null && accountBalance(a, tx) < min;
+        return a.kind == AccountKind.bank &&
+            min != null &&
+            (balances[a.id] ?? 0) < min;
       }).toList();
       return Scaffold(
         appBar: AppBar(title: const Text('Tally')),
@@ -353,8 +419,9 @@ class HomeScreen extends StatelessWidget {
             if (accounts.length > 1) ...[
               const SizedBox(height: 12),
               ...accounts.map((a) {
-                final accBalance = accountBalance(a, tx);
+                final accBalance = balances[a.id] ?? 0;
                 final low =
+                    a.kind == AccountKind.bank &&
                     a.minBalanceMinor != null &&
                     accBalance < a.minBalanceMinor!;
                 return Padding(
@@ -363,7 +430,7 @@ class HomeScreen extends StatelessWidget {
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       Text(
-                        a.name,
+                        a.kind == AccountKind.card ? '${a.name} (card)' : a.name,
                         style: Theme.of(context).textTheme.bodySmall,
                       ),
                       Text(
@@ -378,6 +445,12 @@ class HomeScreen extends StatelessWidget {
                   ),
                 );
               }),
+            ],
+            if (detections.isNotEmpty) ...[
+              const SizedBox(height: 16),
+              ...detections.map(
+                (d) => _DetectedAccountCard(detection: d, onChanged: onChanged),
+              ),
             ],
             if (lowAccounts.isNotEmpty) ...[
               const SizedBox(height: 16),
@@ -487,16 +560,14 @@ class HomeScreen extends StatelessWidget {
                 TextButton(onPressed: onChanged, child: const Text('Refresh')),
               ],
             ),
-            ...tx
-                .take(6)
-                .map(
-                  (t) => TransactionTile(
-                    transaction: t,
-                    symbol: symbol,
-                    onTap: () =>
-                        showTransactionSheet(context, onChanged, existing: t),
-                  ),
-                ),
+            ...tx.map(
+              (t) => TransactionTile(
+                transaction: t,
+                symbol: symbol,
+                onTap: () =>
+                    showTransactionSheet(context, onChanged, existing: t),
+              ),
+            ),
           ],
         ),
       );
@@ -504,21 +575,103 @@ class HomeScreen extends StatelessWidget {
   );
 }
 
-class TransactionsScreen extends StatelessWidget {
+/// Quiet prompt for an untracked (bank, last4) pair seen enough in SMS to be
+/// worth naming as an account or card.
+class _DetectedAccountCard extends StatelessWidget {
+  const _DetectedAccountCard({required this.detection, required this.onChanged});
+  final DetectedAccount detection;
+  final VoidCallback onChanged;
+
+  Future<void> _add(BuildContext context) async {
+    final db = TallyDatabase.instance;
+    final now = detection.lastSeen;
+    await db.addAccountAndClaim(
+      Account(
+        id: null,
+        name: detection.suggestedName,
+        last4: detection.last4,
+        openingBalanceMinor: detection.lastBalanceMinor ?? 0,
+        reportedBalanceMinor: detection.lastBalanceMinor,
+        reportedAt: detection.lastBalanceMinor == null ? null : now,
+        kind: detection.kind,
+      ),
+      bank: detection.bank,
+    );
+    await db.linkSelfTransfers();
+    await db.dismissDetection(detection.bank, detection.last4);
+    onChanged();
+  }
+
+  Future<void> _dismiss() async {
+    await TallyDatabase.instance.dismissDetection(
+      detection.bank,
+      detection.last4,
+    );
+    onChanged();
+  }
+
+  @override
+  Widget build(BuildContext context) => Card(
+    child: Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 8, 10),
+      child: Row(
+        children: [
+          Expanded(
+            child: Text(
+              'Found ${detection.suggestedName} in ${detection.messageCount} '
+              'messages',
+              style: Theme.of(context).textTheme.bodyMedium,
+            ),
+          ),
+          TextButton(onPressed: _dismiss, child: const Text('Dismiss')),
+          FilledButton(
+            onPressed: () => _add(context),
+            child: const Text('Add'),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+const _transactionsPageSize = 200;
+
+class TransactionsScreen extends StatefulWidget {
   const TransactionsScreen({super.key, required this.onChanged});
   final VoidCallback onChanged;
+  @override
+  State<TransactionsScreen> createState() => _TransactionsScreenState();
+}
+
+class _TransactionsScreenState extends State<TransactionsScreen> {
+  int _limit = _transactionsPageSize;
+  late Future<List<Object?>> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  void _load() => _future = Future.wait([
+    TallyDatabase.instance.transactions(limit: _limit),
+    TallyDatabase.instance.currency(),
+  ]);
+
+  void _loadMore() => setState(() {
+    _limit += _transactionsPageSize;
+    _load();
+  });
 
   @override
   Widget build(BuildContext context) => FutureBuilder<List<Object?>>(
-    future: Future.wait([
-      TallyDatabase.instance.transactions(),
-      TallyDatabase.instance.currency(),
-    ]),
+    future: _future,
     builder: (context, snapshot) {
       if (!snapshot.hasData)
         return const Scaffold(body: Center(child: CircularProgressIndicator()));
       final transactions = snapshot.data![0] as List<TallyTransaction>;
       final symbol = snapshot.data![1] as String;
+      final canLoadMore = transactions.length >= _limit;
       return Scaffold(
         appBar: AppBar(title: const Text('Activity')),
         body: transactions.isEmpty
@@ -530,15 +683,22 @@ class TransactionsScreen extends StatelessWidget {
                   20,
                   100 + MediaQuery.viewPaddingOf(context).bottom,
                 ),
-                itemCount: transactions.length,
+                itemCount: transactions.length + (canLoadMore ? 1 : 0),
                 itemBuilder: (_, index) {
+                  if (index == transactions.length)
+                    return Center(
+                      child: TextButton(
+                        onPressed: _loadMore,
+                        child: const Text('Load more'),
+                      ),
+                    );
                   final transaction = transactions[index];
                   return Dismissible(
                     key: ValueKey(transaction.id),
                     direction: DismissDirection.endToStart,
                     onDismissed: (_) async {
                       await TallyDatabase.instance.delete(transaction.id!);
-                      onChanged();
+                      widget.onChanged();
                     },
                     background: Container(
                       alignment: Alignment.centerRight,
@@ -551,7 +711,7 @@ class TransactionsScreen extends StatelessWidget {
                       symbol: symbol,
                       onTap: () => showTransactionSheet(
                         context,
-                        onChanged,
+                        widget.onChanged,
                         existing: transaction,
                       ),
                     ),
@@ -782,8 +942,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
       builder: (dialogContext) => AlertDialog(
         title: const Text('Re-read SMS?'),
         content: const Text(
-          'Deletes transactions imported from SMS and reads your inbox '
-          'again. Manual and statement entries stay.',
+          'Re-parses every SMS transaction from its saved message text. '
+          'Manual category and account changes stay.',
         ),
         actions: [
           TextButton(
@@ -798,8 +958,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       ),
     );
     if (confirmed != true) return;
-    await TallyDatabase.instance.deleteSmsRows();
-    final report = await ingestHistoricSms();
+    final report = await rereadStoredSms();
     await recategorizeReviewQueue();
     widget.onChanged();
     if (!mounted) return;
@@ -937,24 +1096,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
             ),
             const Divider(height: 32),
-            ListTile(
-              leading: const Icon(Icons.sms_outlined),
-              title: const Text('Bank SMS'),
-              subtitle: Text(
-                _smsStatus.isEmpty
-                    ? 'Scan your inbox for past transactions'
-                    : _smsStatus,
+            ValueListenableBuilder<SyncStatus?>(
+              valueListenable: smsSyncStatus,
+              builder: (context, status, _) => Column(
+                children: [
+                  ListTile(
+                    leading: const Icon(Icons.sms_outlined),
+                    title: const Text('Bank SMS'),
+                    subtitle: Text(
+                      _smsStatus.isEmpty
+                          ? 'Scan your inbox for past transactions'
+                          : _smsStatus,
+                    ),
+                    trailing: FilledButton(
+                      onPressed: status == null ? _scanSms : null,
+                      child: const Text('Scan SMS inbox'),
+                    ),
+                  ),
+                  ListTile(
+                    leading: const Icon(Icons.restart_alt_outlined),
+                    title: const Text('Re-read SMS'),
+                    subtitle: const Text('Fix wrongly parsed SMS transactions'),
+                    onTap: status == null
+                        ? () => _confirmRereadSms(context)
+                        : null,
+                  ),
+                ],
               ),
-              trailing: FilledButton(
-                onPressed: _scanSms,
-                child: const Text('Scan SMS inbox'),
-              ),
-            ),
-            ListTile(
-              leading: const Icon(Icons.restart_alt_outlined),
-              title: const Text('Re-read SMS'),
-              subtitle: const Text('Fix wrongly parsed SMS transactions'),
-              onTap: () => _confirmRereadSms(context),
             ),
             ListTile(
               leading: const Icon(Icons.file_upload_outlined),
@@ -1018,6 +1186,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
           : (existing!.minBalanceMinor! / 100).toStringAsFixed(2),
     );
     var inBudget = existing?.inBudget ?? true;
+    var kind = existing?.kind ?? AccountKind.bank;
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
@@ -1054,6 +1223,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
                     labelText: 'Last 4 digits (optional)',
                     counterText: '',
                   ),
+                ),
+                const SizedBox(height: 10),
+                SegmentedButton<AccountKind>(
+                  segments: const [
+                    ButtonSegment(
+                      value: AccountKind.bank,
+                      label: Text('Bank account'),
+                    ),
+                    ButtonSegment(
+                      value: AccountKind.card,
+                      label: Text('Credit card'),
+                    ),
+                  ],
+                  selected: {kind},
+                  onSelectionChanged: (v) => setSheetState(() => kind = v.first),
                 ),
                 const SizedBox(height: 10),
                 TextField(
@@ -1108,11 +1292,24 @@ class _SettingsScreenState extends State<SettingsScreen> {
                             : existing.reportedAt,
                         inBudget: inBudget,
                         minBalanceMinor: parseMoney(minBalance.text),
+                        kind: kind,
                       );
-                      if (existing == null)
-                        await TallyDatabase.instance.addAccount(account);
-                      else
+                      if (existing == null) {
+                        await TallyDatabase.instance.addAccountAndClaim(
+                          account,
+                        );
+                        await TallyDatabase.instance.linkSelfTransfers();
+                      } else {
                         await TallyDatabase.instance.updateAccount(account);
+                        if (account.last4.isNotEmpty &&
+                            account.last4 != existing.last4) {
+                          await TallyDatabase.instance.claimOrphans(
+                            account.id!,
+                            last4: account.last4,
+                          );
+                          await TallyDatabase.instance.linkSelfTransfers();
+                        }
+                      }
                       if (sheetContext.mounted) Navigator.pop(sheetContext);
                       widget.onChanged();
                       setState(() {});
@@ -1180,7 +1377,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
 }
 
 String _describeIngest(IngestReport report) =>
-    '${report.inserted} added, ${report.duplicates} already saved, ${report.ignored} skipped';
+    '${report.inserted} added, ${report.duplicates} already saved, '
+    '${report.ignored} skipped'
+    '${report.failed > 0 ? ', ${report.failed} failed' : ''}';
 
 /// Bottom sheet for both adding a transaction and editing one (tap any
 /// tile). [existing] null means "add"; otherwise the sheet edits that row,
@@ -1374,6 +1573,24 @@ void showTransactionSheet(
                   child: const Text('Save transaction'),
                 ),
               ),
+              if (existing?.smsBody?.isNotEmpty ?? false) ...[
+                const SizedBox(height: 8),
+                Theme(
+                  data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                  child: ExpansionTile(
+                    tilePadding: EdgeInsets.zero,
+                    title: const Text('Original message'),
+                    childrenPadding: const EdgeInsets.only(bottom: 8),
+                    expandedAlignment: Alignment.centerLeft,
+                    children: [
+                      Text(
+                        existing!.smsBody!,
+                        style: Theme.of(context).textTheme.bodySmall,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               if (existing != null) ...[
                 const SizedBox(height: 8),
                 SizedBox(

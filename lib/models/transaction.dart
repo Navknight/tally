@@ -24,6 +24,10 @@ class TallyTransaction {
     this.needsReview = false,
     this.excludeFromBudget = false,
     this.transferAccountId,
+    this.accountLast4,
+    this.bank,
+    this.smsBody,
+    this.smsSender,
   });
 
   final int? id;
@@ -61,6 +65,17 @@ class TallyTransaction {
   /// Destination account for a [TransactionKind.transfer] row; [accountId] is
   /// the source. Null for every other kind.
   final int? transferAccountId;
+
+  /// Account/card last-4 and bank name as parsed from the SMS (or known from
+  /// statement import), independent of whether they matched a tracked
+  /// account. Used to detect untracked accounts and cards.
+  final String? accountLast4;
+  final String? bank;
+
+  /// The original SMS text and sender, kept only for source == 'sms' rows so
+  /// a re-read can reparse in place and the transaction sheet can show it.
+  final String? smsBody;
+  final String? smsSender;
 
   /// Signed effect on a balance. Transfers between tracked accounts net out at
   /// the portfolio level, so they contribute nothing.
@@ -105,6 +120,10 @@ class TallyTransaction {
     transferAccountId: clearTransferAccount
         ? null
         : (transferAccountId ?? this.transferAccountId),
+    accountLast4: accountLast4,
+    bank: bank,
+    smsBody: smsBody,
+    smsSender: smsSender,
   );
 
   Map<String, Object?> toMap() => {
@@ -124,6 +143,10 @@ class TallyTransaction {
     'needs_review': needsReview ? 1 : 0,
     'exclude_from_budget': excludeFromBudget ? 1 : 0,
     'transfer_account_id': transferAccountId,
+    'account_last4': accountLast4,
+    'bank': bank,
+    'sms_body': smsBody,
+    'sms_sender': smsSender,
   };
 
   factory TallyTransaction.fromMap(Map<String, Object?> map) =>
@@ -152,5 +175,9 @@ class TallyTransaction {
         needsReview: (map['needs_review'] as int?) == 1,
         excludeFromBudget: (map['exclude_from_budget'] as int?) == 1,
         transferAccountId: map['transfer_account_id'] as int?,
+        accountLast4: map['account_last4'] as String?,
+        bank: map['bank'] as String?,
+        smsBody: map['sms_body'] as String?,
+        smsSender: map['sms_sender'] as String?,
       );
 }

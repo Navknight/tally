@@ -21,6 +21,14 @@ class InMemoryCategoryStore implements CategoryStore {
       Map.of(_tokenCounts[token] ?? {});
 
   @override
+  Future<Map<String, Map<String, int>>> tokenCountsBatch(
+    List<String> tokens,
+  ) async => {
+    for (final t in tokens)
+      if (_tokenCounts.containsKey(t)) t: Map.of(_tokenCounts[t]!),
+  };
+
+  @override
   Future<Map<String, int>> categoryCounts() async => Map.of(_categoryCounts);
 
   @override

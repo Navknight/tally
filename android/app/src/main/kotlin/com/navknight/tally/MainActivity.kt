@@ -4,6 +4,10 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.database.ContentObserver
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.provider.Telephony
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -16,13 +20,19 @@ class MainActivity : FlutterActivity() {
     private var fileResult: MethodChannel.Result? = null
     private var saveResult: MethodChannel.Result? = null
     private var pendingSaveBytes: ByteArray? = null
+    private var channel: MethodChannel? = null
+    private var smsObserver: ContentObserver? = null
+    private val debounceHandler = Handler(Looper.getMainLooper())
+    private val notifySmsChanged = Runnable { channel?.invokeMethod("smsChanged", null) }
+
     override fun configureFlutterEngine(engine: FlutterEngine) {
         super.configureFlutterEngine(engine)
-        MethodChannel(engine.dartExecutor.binaryMessenger, "com.navknight.tally/platform").setMethodCallHandler { call, result ->
+        val ch = MethodChannel(engine.dartExecutor.binaryMessenger, "com.navknight.tally/platform")
+        channel = ch
+        ch.setMethodCallHandler { call, result ->
             when (call.method) {
-                "requestSmsPermission" -> if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECEIVE_SMS) == PackageManager.PERMISSION_GRANTED) result.success(true) else { smsResult = result; ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECEIVE_SMS, Manifest.permission.READ_SMS), 41) }
-                "takePendingSms" -> { val p = getSharedPreferences("tally_sms", MODE_PRIVATE); val raw = p.getString("pending", "") ?: ""; p.edit().remove("pending").apply(); result.success(decodeMessages(raw)) }
-                "readHistoricSms" -> result.success(readHistoricSms())
+                "requestSmsPermission" -> if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) == PackageManager.PERMISSION_GRANTED) result.success(true) else { smsResult = result; ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_SMS), 41) }
+                "readSmsSince" -> result.success(readSmsSince((call.argument<Number>("since") ?: 0L).toLong()))
                 "pickStatement" -> { fileResult = result; startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*"; putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("text/csv", "text/comma-separated-values", "text/plain", "application/pdf")) }, 42) }
                 "saveFile" -> {
                     val name = call.argument<String>("name") ?: "export.csv"
@@ -35,14 +45,20 @@ class MainActivity : FlutterActivity() {
             }
         }
     }
-    private fun decodeMessages(raw: String): List<Map<String, Any>> = raw.split("\u0000").filter { it.isNotBlank() }.mapNotNull { row ->
-        val fields = row.split("\u0001", limit = 3)
-        if (fields.size == 3) mapOf("sender" to fields[0], "timestamp" to (fields[1].toLongOrNull() ?: 0L), "body" to fields[2]) else null
-    }
-    private fun readHistoricSms(): List<Map<String, Any>> {
+
+    /// Inbox rows newer than [since], oldest first, capped at 5000: the SMS
+    /// provider stores a multipart message's body whole, so no fragment
+    /// reassembly is needed here the way the old broadcast receiver required.
+    private fun readSmsSince(since: Long): List<Map<String, Any>> {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return emptyList()
         val messages = ArrayList<Map<String, Any>>()
-        contentResolver.query(Telephony.Sms.Inbox.CONTENT_URI, arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE), null, null, "date DESC LIMIT 5000")?.use { cursor ->
+        contentResolver.query(
+            Telephony.Sms.Inbox.CONTENT_URI,
+            arrayOf(Telephony.Sms.ADDRESS, Telephony.Sms.BODY, Telephony.Sms.DATE),
+            "${Telephony.Sms.DATE} > ?",
+            arrayOf(since.toString()),
+            "${Telephony.Sms.DATE} ASC LIMIT 5000",
+        )?.use { cursor ->
             val senderIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.ADDRESS)
             val bodyIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.BODY)
             val dateIndex = cursor.getColumnIndexOrThrow(Telephony.Sms.DATE)
@@ -50,6 +66,27 @@ class MainActivity : FlutterActivity() {
         }
         return messages
     }
+
+    override fun onResume() {
+        super.onResume()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return
+        val observer = object : ContentObserver(debounceHandler) {
+            override fun onChange(selfChange: Boolean, uri: Uri?) {
+                debounceHandler.removeCallbacks(notifySmsChanged)
+                debounceHandler.postDelayed(notifySmsChanged, 1000)
+            }
+        }
+        smsObserver = observer
+        contentResolver.registerContentObserver(Telephony.Sms.CONTENT_URI, true, observer)
+    }
+
+    override fun onPause() {
+        smsObserver?.let { contentResolver.unregisterContentObserver(it) }
+        smsObserver = null
+        debounceHandler.removeCallbacks(notifySmsChanged)
+        super.onPause()
+    }
+
     override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grants: IntArray) { super.onRequestPermissionsResult(code, permissions, grants); if (code == 41) { smsResult?.success(grants.isNotEmpty() && grants[0] == PackageManager.PERMISSION_GRANTED); smsResult = null } }
     override fun onActivityResult(code: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(code, resultCode, data)

@@ -27,7 +27,7 @@ class InsightsScreen extends StatelessWidget {
         db.dailySpend(period),
         db.currency(),
         db.setting('monthly_budget'),
-        db.budgetRows(period),
+        db.budgetRowsPage(period),
       ]);
     }(),
     builder: (context, snapshot) {
@@ -40,7 +40,8 @@ class InsightsScreen extends StatelessWidget {
       final symbol = values[3] as String;
       final budget = int.tryParse(values[4] as String? ?? '0') ?? 0;
       final total = byCategory.fold<int>(0, (sum, e) => sum + e.$2);
-      final counted = values[5] as List<TallyTransaction>;
+      final (counted, countedTotal) =
+          values[5] as (List<TallyTransaction>, int);
 
       return Scaffold(
         appBar: AppBar(title: const Text('Insights')),
@@ -104,12 +105,18 @@ class InsightsScreen extends StatelessWidget {
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                   Text(
-                    '${counted.length} transactions',
+                    countedTotal > counted.length
+                        ? 'Showing ${counted.length} of $countedTotal transactions'
+                        : '$countedTotal transactions',
                     style: Theme.of(context).textTheme.bodySmall,
                   ),
                   const SizedBox(height: 8),
-                  ...counted.map(
-                    (t) => TransactionTile(transaction: t, symbol: symbol),
+                  ListView.builder(
+                    shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
+                    itemCount: counted.length,
+                    itemBuilder: (_, i) =>
+                        TransactionTile(transaction: counted[i], symbol: symbol),
                   ),
                 ],
               ),

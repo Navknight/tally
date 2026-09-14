@@ -45,4 +45,28 @@ void main() {
     ).fingerprint!;
     expect(fp(DateTime(2026)), fp(DateTime(2027)));
   });
+
+  group('nextWatermark', () {
+    BankSms at(DateTime t) => BankSms(sender: 'AD-HDFCBK', timestamp: t, body: 'x');
+
+    test('advances to the latest message timestamp', () {
+      final watermark = nextWatermark(0, [
+        at(DateTime(2026, 1, 1)),
+        at(DateTime(2026, 1, 3)),
+        at(DateTime(2026, 1, 2)),
+      ]);
+      expect(watermark, DateTime(2026, 1, 3).millisecondsSinceEpoch);
+    });
+
+    test('never moves backward past the current watermark', () {
+      final current = DateTime(2026, 5, 1).millisecondsSinceEpoch;
+      final watermark = nextWatermark(current, [at(DateTime(2020, 1, 1))]);
+      expect(watermark, current);
+    });
+
+    test('stays put when no messages arrived', () {
+      final current = DateTime(2026, 5, 1).millisecondsSinceEpoch;
+      expect(nextWatermark(current, const []), current);
+    });
+  });
 }

@@ -5,21 +5,32 @@ import 'package:flutter/services.dart';
 class AndroidBridge {
   static const _channel = MethodChannel('com.navknight.tally/platform');
 
+  /// Calls [callback] whenever the native ContentObserver sees the SMS
+  /// provider change while the activity is alive (debounced natively).
+  static void onSmsChanged(void Function() callback) {
+    if (!Platform.isAndroid) return;
+    _channel.setMethodCallHandler((call) async {
+      if (call.method == 'smsChanged') callback();
+    });
+  }
+
   static Future<bool> requestSmsPermission() async {
     if (!Platform.isAndroid) return false;
     return (await _channel.invokeMethod<bool>('requestSmsPermission')) ?? false;
   }
 
-  static Future<List<BankSms>> pendingSms() async =>
-      _messages('takePendingSms');
+  /// Inbox rows strictly newer than [sinceMillis], oldest first, capped at
+  /// 5000 by the platform side.
+  static Future<List<BankSms>> smsSince(int sinceMillis) async =>
+      _messages('readSmsSince', {'since': sinceMillis});
 
-  /// Bounded historic scan. Android reads only local SMS provider rows.
-  static Future<List<BankSms>> historicSms() async =>
-      _messages('readHistoricSms');
-
-  static Future<List<BankSms>> _messages(String method) async {
+  static Future<List<BankSms>> _messages(
+    String method, [
+    Map<String, Object?>? args,
+  ]) async {
     if (!Platform.isAndroid) return const [];
-    final rows = await _channel.invokeListMethod<dynamic>(method) ?? const [];
+    final rows =
+        await _channel.invokeListMethod<dynamic>(method, args) ?? const [];
     return rows
         .whereType<Map>()
         .map(

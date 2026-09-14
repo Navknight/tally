@@ -4,6 +4,7 @@ import 'package:sqflite/sqflite.dart';
 import '../core/budget_period.dart';
 import '../models/account.dart';
 import '../models/categories.dart';
+import '../models/detected_account.dart';
 import '../models/transaction.dart';
 import '../models/transfer.dart';
 import '../services/categorizer.dart';
@@ -17,7 +18,7 @@ class TallyDatabase implements CategoryStore {
 
   Future<Database> get _db async => _database ??= await openDatabase(
     join(await getDatabasesPath(), 'tally.db'),
-    version: 4,
+    version: 5,
     onCreate: (db, _) async {
       await db.execute('''CREATE TABLE settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL)''');
@@ -30,7 +31,8 @@ class TallyDatabase implements CategoryStore {
             category_source TEXT NOT NULL DEFAULT 'manual',
             needs_review INTEGER NOT NULL DEFAULT 0,
             exclude_from_budget INTEGER NOT NULL DEFAULT 0,
-            transfer_account_id INTEGER)''');
+            transfer_account_id INTEGER,
+            account_last4 TEXT, bank TEXT, sms_body TEXT, sms_sender TEXT)''');
       await db.execute(
         'CREATE INDEX tx_date ON transactions(occurred_at DESC)',
       );
@@ -38,6 +40,7 @@ class TallyDatabase implements CategoryStore {
         'CREATE UNIQUE INDEX tx_fingerprint ON transactions(fingerprint)',
       );
       await _createV3(db);
+      await _createV5(db);
     },
     onUpgrade: (db, oldVersion, _) async {
       if (oldVersion < 2) {
@@ -75,6 +78,19 @@ class TallyDatabase implements CategoryStore {
           ])
             await db.execute('ALTER TABLE accounts ADD COLUMN $column');
       }
+      if (oldVersion < 5) {
+        await db.execute(
+          "ALTER TABLE accounts ADD COLUMN kind TEXT NOT NULL DEFAULT 'bank'",
+        );
+        for (final column in const [
+          'account_last4 TEXT',
+          'bank TEXT',
+          'sms_body TEXT',
+          'sms_sender TEXT',
+        ])
+          await db.execute('ALTER TABLE transactions ADD COLUMN $column');
+        await _createV5(db);
+      }
     },
   );
 
@@ -83,7 +99,8 @@ class TallyDatabase implements CategoryStore {
       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
       last4 TEXT NOT NULL DEFAULT '', opening_balance_minor INTEGER NOT NULL DEFAULT 0,
       reported_balance_minor INTEGER, reported_at INTEGER,
-      in_budget INTEGER NOT NULL DEFAULT 1, min_balance_minor INTEGER)''');
+      in_budget INTEGER NOT NULL DEFAULT 1, min_balance_minor INTEGER,
+      kind TEXT NOT NULL DEFAULT 'bank')''');
     await db.execute('''CREATE TABLE merchant_rules (
       merchant_key TEXT PRIMARY KEY, category TEXT NOT NULL,
       hits INTEGER NOT NULL DEFAULT 1)''');
@@ -93,6 +110,22 @@ class TallyDatabase implements CategoryStore {
     await db.execute('''CREATE TABLE category_stats (
       category TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0)''');
     await db.execute('CREATE INDEX tx_review ON transactions(needs_review)');
+  }
+
+  /// Detected-account table plus every index schema v5 adds. Split out so
+  /// both a fresh [onCreate] and a v4->v5 [onUpgrade] can share it.
+  static Future<void> _createV5(Database db) async {
+    await db.execute('''CREATE TABLE detected_accounts (
+      bank TEXT NOT NULL, last4 TEXT NOT NULL, kind TEXT NOT NULL,
+      message_count INTEGER NOT NULL DEFAULT 0, last_balance_minor INTEGER,
+      last_seen INTEGER NOT NULL, dismissed INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (bank, last4))''');
+    await db.execute('CREATE INDEX tx_reference ON transactions(reference)');
+    await db.execute('CREATE INDEX tx_account ON transactions(account_id)');
+    await db.execute(
+      'CREATE INDEX tx_account_last4 ON transactions(account_id, account_last4)',
+    );
+    await db.execute('CREATE INDEX tx_source ON transactions(source)');
   }
 
   /// v2 kept one global opening balance in `settings`. Carry it into a real
@@ -139,6 +172,43 @@ class TallyDatabase implements CategoryStore {
 
   Future<int> addAccount(Account account) async =>
       (await _db).insert('accounts', account.toMap()..remove('id'));
+
+  /// Adds [account] and, in the same transaction, reassigns every orphan
+  /// transaction that matches its last4 (and [bank], when known) to it.
+  /// Callers still run [linkSelfTransfers] afterward since that reads back
+  /// through the normal query path. Returns the new account id.
+  Future<int> addAccountAndClaim(Account account, {String? bank}) async {
+    final db = await _db;
+    late int id;
+    await db.transaction((txn) async {
+      id = await txn.insert('accounts', account.toMap()..remove('id'));
+      if (account.last4.isEmpty) return;
+      final orphans = await txn.query(
+        'transactions',
+        columns: ['id', 'account_last4', 'bank'],
+        where: 'account_id IS NULL',
+      );
+      final ids = orphans
+          .where(
+            (row) => matchesForClaim(
+              rowLast4: row['account_last4'] as String? ?? '',
+              rowBank: row['bank'] as String?,
+              last4: account.last4,
+              bank: bank,
+            ),
+          )
+          .map((row) => row['id'] as int)
+          .toList();
+      if (ids.isNotEmpty)
+        await txn.update(
+          'transactions',
+          {'account_id': id},
+          where: 'id IN (${List.filled(ids.length, '?').join(',')})',
+          whereArgs: ids,
+        );
+    });
+    return id;
+  }
 
   Future<void> updateAccount(Account account) async => (await _db).update(
     'accounts',
@@ -187,6 +257,135 @@ class TallyDatabase implements CategoryStore {
     where: 'id = ? AND (reported_at IS NULL OR reported_at < ?)',
     whereArgs: [accountId, at.millisecondsSinceEpoch],
   );
+
+  /// Per-account balance computed in SQL: the reported-balance anchor (or
+  /// opening balance when nothing has reported yet) plus every transaction
+  /// after that anchor, transfers included via `transfer_account_id`. Same
+  /// arithmetic as the pure [accountBalance]/[totalBalance] in
+  /// models/account.dart, which is what the test suite exercises directly —
+  /// sqflite has no in-memory FFI build available here to run this query
+  /// against in a widget-free test, so this SQL path is verified by reading
+  /// the query rather than by an automated comparison.
+  Future<Map<int, int>> accountBalancesSql() async {
+    final rows = await (await _db).rawQuery('''
+      SELECT a.id AS id,
+        (CASE WHEN a.reported_at IS NULL THEN a.opening_balance_minor
+              ELSE COALESCE(a.reported_balance_minor, a.opening_balance_minor) END)
+        + COALESCE((SELECT SUM(CASE WHEN t.kind = 'income' THEN t.amount_minor
+                                     WHEN t.kind = 'expense' THEN -t.amount_minor
+                                     WHEN t.kind = 'transfer' THEN -t.amount_minor
+                                     ELSE 0 END)
+                    FROM transactions t
+                    WHERE t.account_id = a.id
+                      AND (a.reported_at IS NULL OR t.occurred_at > a.reported_at)), 0)
+        + COALESCE((SELECT SUM(t2.amount_minor) FROM transactions t2
+                    WHERE t2.transfer_account_id = a.id
+                      AND (a.reported_at IS NULL OR t2.occurred_at > a.reported_at)), 0)
+        AS balance
+      FROM accounts a''');
+    return {
+      for (final row in rows) row['id'] as int: (row['balance'] as int?) ?? 0,
+    };
+  }
+
+  /// Sum of [accountBalancesSql] over bank accounts only; cards never count.
+  Future<int> totalBalanceSql() async {
+    final balances = await accountBalancesSql();
+    final bankIds = (await accounts())
+        .where((a) => a.kind == AccountKind.bank)
+        .map((a) => a.id);
+    return bankIds.fold<int>(0, (sum, id) => sum + (balances[id] ?? 0));
+  }
+
+  /// Same filters as the pure [budgetSpent], computed with one SUM instead of
+  /// loading every transaction.
+  Future<int> spentInPeriodSql(BudgetPeriod period) async {
+    final rows = await (await _db).rawQuery(
+      '''SELECT SUM(t.amount_minor) AS total FROM transactions t
+         JOIN accounts a ON a.id = t.account_id
+         WHERE t.kind = ? AND t.exclude_from_budget = 0 AND a.in_budget = 1
+           AND t.occurred_at >= ? AND t.occurred_at < ?''',
+      [
+        TransactionKind.expense.name,
+        period.start.millisecondsSinceEpoch,
+        period.end.millisecondsSinceEpoch,
+      ],
+    );
+    return (rows.first['total'] as int?) ?? 0;
+  }
+
+  // ---------------------------------------------------------- detections
+
+  /// Non-dismissed bank/card detections, most-seen first.
+  Future<List<DetectedAccount>> detectedAccounts() async => (await _db)
+      .query(
+        'detected_accounts',
+        where: 'dismissed = 0',
+        orderBy: 'message_count DESC',
+      )
+      .then((rows) => rows.map(DetectedAccount.fromMap).toList());
+
+  /// Records or bumps a detection for a (bank, last4) pair that matched no
+  /// tracked account. Called during ingestion for every such parsed message.
+  Future<void> upsertDetection({
+    required String bank,
+    required String last4,
+    required AccountKind kind,
+    int? balanceMinor,
+    required DateTime at,
+  }) async => (await _db).rawInsert(
+    '''INSERT INTO detected_accounts (bank, last4, kind, message_count, last_balance_minor, last_seen, dismissed)
+       VALUES (?, ?, ?, 1, ?, ?, 0)
+       ON CONFLICT(bank, last4) DO UPDATE SET
+         message_count = message_count + 1,
+         kind = excluded.kind,
+         last_balance_minor = COALESCE(excluded.last_balance_minor, last_balance_minor),
+         last_seen = MAX(last_seen, excluded.last_seen)''',
+    [bank, last4, kind.name, balanceMinor, at.millisecondsSinceEpoch],
+  );
+
+  Future<void> dismissDetection(String bank, String last4) async =>
+      (await _db).update(
+        'detected_accounts',
+        {'dismissed': 1},
+        where: 'bank = ? AND last4 = ?',
+        whereArgs: [bank, last4],
+      );
+
+  /// Assigns every orphan transaction (no account yet) that matches [last4]
+  /// (suffix match, either direction) and [bank] (when both are set) to
+  /// [accountId]. Used both after adding an account from a detection and
+  /// after adding one by hand in Settings. Returns rows claimed.
+  Future<int> claimOrphans(
+    int accountId, {
+    required String last4,
+    String? bank,
+  }) async {
+    final db = await _db;
+    final orphans = await db.query(
+      'transactions',
+      columns: ['id', 'account_last4', 'bank'],
+      where: 'account_id IS NULL',
+    );
+    final ids = orphans
+        .where(
+          (row) => matchesForClaim(
+            rowLast4: row['account_last4'] as String? ?? '',
+            rowBank: row['bank'] as String?,
+            last4: last4,
+            bank: bank,
+          ),
+        )
+        .map((row) => row['id'] as int)
+        .toList();
+    if (ids.isEmpty) return 0;
+    return db.update(
+      'transactions',
+      {'account_id': accountId},
+      where: 'id IN (${List.filled(ids.length, '?').join(',')})',
+      whereArgs: ids,
+    );
+  }
 
   // ------------------------------------------------------------ transactions
 
@@ -244,6 +443,69 @@ class TallyDatabase implements CategoryStore {
         limit: 1,
       )).isNotEmpty;
 
+  /// Stores one ingested SMS batch: every row (skipping fingerprint/reference
+  /// duplicates the way [add] does) and every reported-balance update, all in
+  /// one transaction so a big historic scan either lands completely or not at
+  /// all. Returns the number of transaction rows actually inserted.
+  Future<int> storeIngestBatch({
+    required List<TallyTransaction> rows,
+    required List<(int accountId, int balanceMinor, DateTime at)>
+    balanceUpdates,
+  }) async {
+    final db = await _db;
+    var inserted = 0;
+    await db.transaction((txn) async {
+      for (final row in rows) {
+        if ((row.reference ?? '').isNotEmpty) {
+          final existing = await txn.query(
+            'transactions',
+            columns: ['id'],
+            where: row.accountId == null
+                ? 'reference = ? AND amount_minor = ? AND account_id IS NULL'
+                : 'reference = ? AND amount_minor = ? AND account_id = ?',
+            whereArgs: row.accountId == null
+                ? [row.reference, row.amountMinor]
+                : [row.reference, row.amountMinor, row.accountId],
+            limit: 1,
+          );
+          if (existing.isNotEmpty) continue;
+        }
+        final id = await txn.insert(
+          'transactions',
+          row.toMap()..remove('id'),
+          conflictAlgorithm: ConflictAlgorithm.ignore,
+        );
+        if (id > 0) inserted++;
+      }
+      for (final (accountId, balanceMinor, at) in balanceUpdates) {
+        await txn.update(
+          'accounts',
+          {
+            'reported_balance_minor': balanceMinor,
+            'reported_at': at.millisecondsSinceEpoch,
+          },
+          where: 'id = ? AND (reported_at IS NULL OR reported_at < ?)',
+          whereArgs: [accountId, at.millisecondsSinceEpoch],
+        );
+      }
+    });
+    return inserted;
+  }
+
+  /// Every SMS-sourced transaction, for a re-read pass.
+  Future<List<TallyTransaction>> smsTransactions() async => (await _db)
+      .query('transactions', where: "source = 'sms'")
+      .then((rows) => rows.map(TallyTransaction.fromMap).toList());
+
+  Future<void> deleteByIds(List<int> ids) async {
+    if (ids.isEmpty) return;
+    await (await _db).delete(
+      'transactions',
+      where: 'id IN (${List.filled(ids.length, '?').join(',')})',
+      whereArgs: ids,
+    );
+  }
+
   Future<int> addAll(Iterable<TallyTransaction> rows) async {
     var inserted = 0;
     final db = await _db;
@@ -300,6 +562,34 @@ class TallyDatabase implements CategoryStore {
 
   Future<int> spentInPeriod(BudgetPeriod period) async =>
       budgetSpent(await transactions(limit: -1), await accounts(), period);
+
+  /// Same rows as [budgetRows], capped at [limit] for a list that never
+  /// walks the whole table; the second value is the true total count.
+  Future<(List<TallyTransaction>, int)> budgetRowsPage(
+    BudgetPeriod period, {
+    int limit = 200,
+  }) async {
+    const filter =
+        't.kind = ? AND t.exclude_from_budget = 0 AND a.in_budget = 1 '
+        'AND t.occurred_at >= ? AND t.occurred_at < ?';
+    final args = [
+      TransactionKind.expense.name,
+      period.start.millisecondsSinceEpoch,
+      period.end.millisecondsSinceEpoch,
+    ];
+    final db = await _db;
+    final countRows = await db.rawQuery(
+      'SELECT COUNT(*) AS c FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE $filter',
+      args,
+    );
+    final count = (countRows.first['c'] as int?) ?? 0;
+    final rows = await db.rawQuery(
+      'SELECT t.* FROM transactions t JOIN accounts a ON a.id = t.account_id '
+      'WHERE $filter ORDER BY t.occurred_at DESC LIMIT ?',
+      [...args, limit],
+    );
+    return (rows.map(TallyTransaction.fromMap).toList(), count);
+  }
 
   Future<void> delete(int id) async =>
       (await _db).delete('transactions', where: 'id = ?', whereArgs: [id]);
@@ -390,6 +680,24 @@ class TallyDatabase implements CategoryStore {
             row['category'] as String: row['count'] as int,
         },
       );
+
+  @override
+  Future<Map<String, Map<String, int>>> tokenCountsBatch(
+    List<String> tokens,
+  ) async {
+    if (tokens.isEmpty) return {};
+    final rows = await (await _db).query(
+      'token_stats',
+      columns: ['token', 'category', 'count'],
+      where: 'token IN (${List.filled(tokens.length, '?').join(',')})',
+      whereArgs: tokens,
+    );
+    final result = <String, Map<String, int>>{};
+    for (final row in rows)
+      (result[row['token'] as String] ??= {})[row['category'] as String] =
+          row['count'] as int;
+    return result;
+  }
 
   @override
   Future<Map<String, int>> categoryCounts() async => (await _db)
