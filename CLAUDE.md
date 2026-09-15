@@ -17,6 +17,18 @@ Two constraints follow from "no bloat" and should be weighed before adding anyth
 
 Steps 1–3 exist in a first cut: multiple accounts, CSV/PDF statement import, a per-bank SMS parser registry, and category learning with a review queue. Still weak: UPI-specific shapes beyond the generic parser, and fixtures for every bank parser.
 
+## Status and backlog
+
+Released: v0.3.0 (tags on GitHub drive releases). Next, in order:
+1. **Bills and due dates** — parse card/loan/EMI "due on" SMS, show on Home, remind before the date.
+2. **Subscriptions** — same merchant, similar amount on a monthly/weekly cycle; list with next expected date.
+
+Decided, don't reopen without the user:
+- Parser accuracy grows from the user's own messages (fixtures in `test/sms_fixtures_test.dart`), not from porting other banks' shapes wholesale.
+- No background processing: SMS are read on open and while the app is open. Background alerts only if the user asks for them.
+- Cards are accounts with `kind = card`: they count toward budget, never toward balance.
+- Debugging real data: phone over adb (`~/Dev/Android/Sdk/platform-tools/adb`), filter SMS on-device and mask 5+ digit runs before printing.
+
 ## Working agreement
 
 - **Spend tokens sparingly.** Fan self-contained modules out to `sonnet`/`haiku` subagents with a precise interface contract in the prompt, and keep only architecture and integration in the main context. Reach for an existing tool or library before hand-rolling logic. Don't re-read files already in context or echo file contents back.
