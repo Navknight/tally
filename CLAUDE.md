@@ -35,6 +35,7 @@ Decided, don't reopen without the user:
 - **Reuse the reference parsers.** Mining PennyWiseAI/Cashiro for real SMS shapes is expected — widen Tally's own regexes from them and improve on them where they're weak. Fetch raw files with `curl` rather than browsing. Keep writing Tally's own Dart: their AGPL-3.0 only binds on distribution, so a verbatim copy would force Tally to be AGPL if it ever ships.
 - **Every parsing rule ships with a fixture.** A pattern without a test in `test/` is a pattern nobody can safely change later.
 - **No AI traces.** No Co-Authored-By or "Generated with" lines in commits or PRs, and no AI-sounding prose in code, comments or docs.
+- **One session per feature.** Start a fresh session for each backlog item instead of extending a long chat; this file is the handover. Before ending a feature, update "Status and backlog" (what shipped, what's next, any new decision) so the next session starts accurate.
 - **Releases** are `v*` tags built by `.github/workflows/release.yml` with signing secrets; the keystore password lives in the system keyring (`secret-tool lookup app tally key release-password`).
 
 ## Commands
