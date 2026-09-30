@@ -27,4 +27,14 @@ Release builds read `android/key.properties`; without it they fall back to the d
 
 ## Privacy
 
-See [PRIVACY.md](PRIVACY.md).
+See [PRIVACY.md](PRIVACY.md). Tally has no internet permission at all.
+
+## Releasing
+
+See [docs/RELEASING.md](docs/RELEASING.md) for cutting a release and for the
+IzzyOnDroid and Google Play submission checklists.
+
+## Licence
+
+[GPL-3.0-or-later](LICENSE). The bank logos in `assets/banks/` are not
+covered by it — see [assets/banks/README.md](assets/banks/README.md).
