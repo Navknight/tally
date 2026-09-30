@@ -21,16 +21,13 @@ class AndroidBridge {
 
   /// Inbox rows strictly newer than [sinceMillis], oldest first, capped at
   /// 5000 by the platform side.
-  static Future<List<BankSms>> smsSince(int sinceMillis) async =>
-      _messages('readSmsSince', {'since': sinceMillis});
-
-  static Future<List<BankSms>> _messages(
-    String method, [
-    Map<String, Object?>? args,
-  ]) async {
+  static Future<List<BankSms>> smsSince(int sinceMillis) async {
     if (!Platform.isAndroid) return const [];
     final rows =
-        await _channel.invokeListMethod<dynamic>(method, args) ?? const [];
+        await _channel.invokeListMethod<dynamic>('readSmsSince', {
+          'since': sinceMillis,
+        }) ??
+        const [];
     return rows
         .whereType<Map>()
         .map(

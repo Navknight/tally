@@ -64,6 +64,13 @@ const _requestMarkers = [
   'folio',
   'nav of',
   'units allotted',
+  // Notices where no money moved in an account the user holds: a declined
+  // card attempt, an EPF passbook update, a loan disbursal.
+  'declined',
+  'passbook balance',
+  'your loan account',
+  'card application',
+  'applying for',
 ];
 
 /// A transaction quoted in a currency Tally cannot convert. Booking the INR

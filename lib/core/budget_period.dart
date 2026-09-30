@@ -16,3 +16,13 @@ BudgetPeriod budgetPeriod(DateTime now, int startDay) {
       : DateTime(now.year, now.month - 1, day);
   return BudgetPeriod(start, DateTime(start.year, start.month + 1, day));
 }
+
+/// How far through the period [now] is, 0 to 1. Spending evenly, this is the
+/// share of the limit that should be gone by now, which is what the marker on
+/// the budget bar points at.
+double budgetPace(BudgetPeriod period, DateTime now) {
+  final total = period.end.difference(period.start).inMinutes;
+  if (total <= 0) return 1;
+  final elapsed = now.difference(period.start).inMinutes;
+  return (elapsed / total).clamp(0, 1).toDouble();
+}

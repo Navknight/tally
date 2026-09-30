@@ -22,8 +22,18 @@ TallyTransaction _leg({
 
 void main() {
   test('matches a same-amount debit and credit on different accounts', () {
-    final debit = _leg(id: 1, kind: TransactionKind.expense, accountId: 1, amount: 5000);
-    final credit = _leg(id: 2, kind: TransactionKind.income, accountId: 2, amount: 5000);
+    final debit = _leg(
+      id: 1,
+      kind: TransactionKind.expense,
+      accountId: 1,
+      amount: 5000,
+    );
+    final credit = _leg(
+      id: 2,
+      kind: TransactionKind.income,
+      accountId: 2,
+      amount: 5000,
+    );
     expect(isSelfTransferPair(debit, credit), isTrue);
 
     final matches = findSelfTransfers([debit, credit]);
@@ -33,8 +43,18 @@ void main() {
   });
 
   test('rejects a mismatched amount', () {
-    final debit = _leg(id: 1, kind: TransactionKind.expense, accountId: 1, amount: 5000);
-    final credit = _leg(id: 2, kind: TransactionKind.income, accountId: 2, amount: 4999);
+    final debit = _leg(
+      id: 1,
+      kind: TransactionKind.expense,
+      accountId: 1,
+      amount: 5000,
+    );
+    final credit = _leg(
+      id: 2,
+      kind: TransactionKind.income,
+      accountId: 2,
+      amount: 4999,
+    );
     expect(isSelfTransferPair(debit, credit), isFalse);
     expect(findSelfTransfers([debit, credit]), isEmpty);
   });
@@ -149,8 +169,18 @@ void main() {
   });
 
   test('rejects legs on the same account', () {
-    final debit = _leg(id: 1, kind: TransactionKind.expense, accountId: 1, amount: 5000);
-    final credit = _leg(id: 2, kind: TransactionKind.income, accountId: 1, amount: 5000);
+    final debit = _leg(
+      id: 1,
+      kind: TransactionKind.expense,
+      accountId: 1,
+      amount: 5000,
+    );
+    final credit = _leg(
+      id: 2,
+      kind: TransactionKind.income,
+      accountId: 1,
+      amount: 5000,
+    );
     expect(isSelfTransferPair(debit, credit), isFalse);
     expect(findSelfTransfers([debit, credit]), isEmpty);
   });

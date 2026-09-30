@@ -36,6 +36,24 @@ void main() {
     final period = budgetPeriod(DateTime(2026, 9, 13), 25);
     expect(period.contains(period.start), isTrue);
     expect(period.contains(period.end), isFalse);
-    expect(period.contains(period.end.subtract(const Duration(milliseconds: 1))), isTrue);
+    expect(
+      period.contains(period.end.subtract(const Duration(milliseconds: 1))),
+      isTrue,
+    );
+  });
+
+  group('budgetPace', () {
+    final period = BudgetPeriod(DateTime(2026, 9, 1), DateTime(2026, 10, 1));
+
+    test('is the share of the period already elapsed', () {
+      expect(budgetPace(period, DateTime(2026, 9, 1)), 0);
+      expect(budgetPace(period, DateTime(2026, 9, 16)), closeTo(0.5, 0.02));
+      expect(budgetPace(period, DateTime(2026, 10, 1)), 1);
+    });
+
+    test('never runs past the period it is asked about', () {
+      expect(budgetPace(period, DateTime(2026, 8, 20)), 0);
+      expect(budgetPace(period, DateTime(2026, 11, 5)), 1);
+    });
   });
 }

@@ -8,6 +8,10 @@ abstract class CategoryStore {
   Future<String?> merchantCategory(String merchantKey);
   Future<void> saveMerchantCategory(String merchantKey, String category);
 
+  /// Drops a merchant rule, so rows from that merchant are guessed again
+  /// instead of being forced to one category.
+  Future<void> forgetMerchantCategory(String merchantKey);
+
   /// category -> times this token appeared in a labelled example.
   Future<Map<String, int>> tokenCounts(String token);
 
@@ -226,7 +230,12 @@ class Categorizer {
     for (final t in tokens) {
       tokenCountsByToken[t] = await store.tokenCounts(t);
     }
-    return _bayesGuess(tokens, categoryCounts, totalExamples, tokenCountsByToken);
+    return _bayesGuess(
+      tokens,
+      categoryCounts,
+      totalExamples,
+      tokenCountsByToken,
+    );
   }
 
   /// Same guess as [guess], for many transactions at once: the category and
@@ -239,9 +248,7 @@ class Categorizer {
     final totalExamples = categoryCounts.values.fold<int>(0, (a, b) => a + b);
     final tokenized = [for (final i in items) tokenize(i.merchant, i.body)];
     final allTokens = <String>{for (final t in tokenized) ...t};
-    final tokenCountsByToken = await store.tokenCountsBatch(
-      allTokens.toList(),
-    );
+    final tokenCountsByToken = await store.tokenCountsBatch(allTokens.toList());
 
     final results = <CategoryGuess>[];
     for (var i = 0; i < items.length; i++) {
@@ -275,7 +282,8 @@ class Categorizer {
     final lowerMerchant = merchant.toLowerCase();
     final lowerBody = body.toLowerCase();
     for (final entry in _seedLexicon.entries)
-      if (lowerMerchant.contains(entry.key)) return CategoryGuess(entry.value, 0.8);
+      if (lowerMerchant.contains(entry.key))
+        return CategoryGuess(entry.value, 0.8);
     for (final entry in _seedLexicon.entries)
       if (lowerBody.contains(entry.key)) return CategoryGuess(entry.value, 0.8);
     return null;
@@ -348,6 +356,13 @@ class Categorizer {
     return CategoryGuess(kUncategorized, bestPosterior, needsReview: true);
   }
 
+  /// Whether a correction contradicts what this merchant was already taught.
+  /// One supermarket is groceries this week and a gift the next, and no SMS
+  /// carries the basket, so a merchant corrected two different ways is left
+  /// without a rule and its later rows come back for review.
+  static bool contradicts(String? existingRule, String correction) =>
+      existingRule != null && existingRule != correction;
+
   /// Records a user's correction so future guesses improve.
   Future<void> learn({
     required String merchant,
@@ -355,7 +370,10 @@ class Categorizer {
     required String category,
   }) async {
     final key = merchantKey(merchant);
-    await store.saveMerchantCategory(key, category);
+    if (contradicts(await store.merchantCategory(key), category))
+      await store.forgetMerchantCategory(key);
+    else
+      await store.saveMerchantCategory(key, category);
     await store.train(tokenize(merchant, body), category);
   }
 }

@@ -17,6 +17,7 @@ import 'platform/android_bridge.dart';
 import 'services/export.dart';
 import 'services/sms_ingestion.dart';
 import 'services/statement_import.dart';
+import 'state/app_state.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -59,6 +60,7 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
   Future<void> _load() async {
     final done = await TallyDatabase.instance.setting('onboarded') == 'true';
     await TallyDatabase.instance.ensureCategorySeed();
+    if (done) await appState.load();
     if (mounted) setState(() => _ready = done);
     if (done) {
       AndroidBridge.onSmsChanged(() => unawaited(_syncSms()));
@@ -76,7 +78,7 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
     final report = await ingestNewSms();
     if (report.considered == 0) return;
     await recategorizeReviewQueue();
-    if (mounted) setState(() {});
+    refreshApp();
   }
 
   @override
@@ -85,7 +87,12 @@ class _AppRootState extends State<AppRoot> with WidgetsBindingObserver {
       return const Scaffold(body: Center(child: CircularProgressIndicator()));
     return _ready!
         ? const TallyShell()
-        : Onboarding(onComplete: () => setState(() => _ready = true));
+        : Onboarding(
+            onComplete: () async {
+              await appState.load();
+              if (mounted) setState(() => _ready = true);
+            },
+          );
   }
 }
 
@@ -119,7 +126,7 @@ class _OnboardingState extends State<Onboarding> {
       _currency.text.trim().isEmpty ? '₹' : _currency.text.trim(),
     );
     await TallyDatabase.instance.setSetting('monthly_budget', '0');
-    await TallyDatabase.instance.addAccount(
+    await TallyDatabase.instance.addAccountAndClaim(
       Account(
         id: null,
         name: _name.text.trim().isEmpty ? 'Main account' : _name.text.trim(),
@@ -166,11 +173,11 @@ class _OnboardingState extends State<Onboarding> {
             const SizedBox(height: 10),
             TextField(
               controller: _last4,
-              maxLength: 4,
-              keyboardType: TextInputType.number,
+              maxLength: 40,
+              keyboardType: TextInputType.text,
               decoration: const InputDecoration(
                 labelText: 'Last 4 digits (optional)',
-                hintText: 'Helps match bank SMS to this account',
+                hintText: 'Add debit card digits too, space separated',
                 counterText: '',
               ),
             ),
@@ -230,9 +237,21 @@ class TallyShell extends StatefulWidget {
 
 class _TallyShellState extends State<TallyShell> {
   int _tab = 0;
-  int _refresh = 0;
-  int _pagesBuiltFor = -1;
-  late List<Widget> _pages;
+
+  /// Tabs the user has opened. A screen is built the first time it is shown
+  /// and then kept alive by the [IndexedStack] - startup lays out Home alone
+  /// instead of five screens' worth of lists and charts, and coming back to a
+  /// tab runs no queries at all, since they all read [appState] rather than
+  /// the database.
+  final Set<int> _visited = {0};
+
+  late final List<Widget> _pages = [
+    HomeScreen(onOpenInsights: () => _showTab(3)),
+    const TransactionsScreen(),
+    const BudgetScreen(),
+    const InsightsScreen(),
+    const SettingsScreen(),
+  ];
 
   @override
   void initState() {
@@ -248,42 +267,26 @@ class _TallyShellState extends State<TallyShell> {
 
   void _onSyncChanged() {
     if (!mounted) return;
-    // A finished sync means new rows may have landed; rebuild the pages once
-    // it's done. While running, just repaint the progress bar.
+    // A finished sync means new rows may have landed; re-read once it's done.
+    // While running, just repaint the progress bar.
     if (smsSyncStatus.value == null)
-      _rebuildPages();
+      refreshApp();
     else
       setState(() {});
   }
 
-  void _rebuildPages() => setState(() => _refresh++);
-
-  /// Rebuilds the page list only when [_refresh] actually changed, so
-  /// switching tabs never re-runs a page's queries.
-  void _ensurePages() {
-    if (_pagesBuiltFor == _refresh) return;
-    _pagesBuiltFor = _refresh;
-    _pages = [
-      HomeScreen(
-        key: ValueKey(_refresh),
-        onChanged: _rebuildPages,
-        onOpenInsights: () => setState(() => _tab = 3),
-      ),
-      TransactionsScreen(key: ValueKey(_refresh), onChanged: _rebuildPages),
-      BudgetScreen(key: ValueKey(_refresh), onChanged: _rebuildPages),
-      InsightsScreen(key: ValueKey(_refresh), onChanged: _rebuildPages),
-      SettingsScreen(key: ValueKey(_refresh), onChanged: _rebuildPages),
-    ];
-  }
+  void _showTab(int i) => setState(() {
+    _tab = i;
+    _visited.add(i);
+  });
 
   @override
   Widget build(BuildContext context) {
-    _ensurePages();
     final status = smsSyncStatus.value;
     return PopScope(
       canPop: _tab == 0,
       onPopInvokedWithResult: (didPop, _) {
-        if (!didPop) setState(() => _tab = 0);
+        if (!didPop) _showTab(0);
       },
       child: Scaffold(
         body: Column(
@@ -302,19 +305,28 @@ class _TallyShellState extends State<TallyShell> {
               ),
             ],
             Expanded(
-              child: IndexedStack(index: _tab, children: _pages),
+              child: IndexedStack(
+                index: _tab,
+                children: [
+                  for (var i = 0; i < _pages.length; i++)
+                    if (_visited.contains(i))
+                      _pages[i]
+                    else
+                      const SizedBox.shrink(),
+                ],
+              ),
             ),
           ],
         ),
         floatingActionButton: _tab < 2
             ? FloatingActionButton(
-                onPressed: () => showTransactionSheet(context, _rebuildPages),
+                onPressed: () => showTransactionSheet(context),
                 child: const Icon(Icons.add),
               )
             : null,
         bottomNavigationBar: NavigationBar(
           selectedIndex: _tab,
-          onDestinationSelected: (i) => setState(() => _tab = i),
+          onDestinationSelected: _showTab,
           destinations: const [
             NavigationDestination(
               icon: Icon(Icons.home_outlined),
@@ -354,233 +366,419 @@ double sheetBottomInset(BuildContext context) =>
     MediaQuery.viewPaddingOf(context).bottom +
     MediaQuery.viewInsetsOf(context).bottom;
 
-class HomeScreen extends StatelessWidget {
-  const HomeScreen({
+/// Re-reads everything after a write. Every screen listens to [appState], so
+/// one call is all any save, delete or sync needs to do.
+void refreshApp() => unawaited(appState.load());
+
+/// A tab: title bar, live [appState], pull to refresh. The spinner shows only
+/// before the first read finishes - after that a refresh repaints in place
+/// rather than emptying the screen.
+class TallyPage extends StatelessWidget {
+  const TallyPage({
     super.key,
-    required this.onChanged,
-    required this.onOpenInsights,
+    required this.title,
+    required this.builder,
+    this.actions,
   });
-  final VoidCallback onChanged;
-  final VoidCallback onOpenInsights;
+  final String title;
+  final Widget Function(BuildContext, AppState) builder;
+  final List<Widget>? actions;
+
   @override
-  Widget build(BuildContext context) => FutureBuilder<List<Object?>>(
-    future: () async {
-      final db = TallyDatabase.instance;
-      final startDay = await db.budgetStartDay();
-      final period = budgetPeriod(DateTime.now(), startDay);
-      return Future.wait([
-        db.transactions(limit: 6),
-        db.accounts(),
-        db.currency(),
-        db.setting('monthly_budget'),
-        db.reviewQueue(),
-        db.spentInPeriodSql(period),
-        db.accountBalancesSql(),
-        db.detectedAccounts(),
-      ]);
-    }(),
-    builder: (context, snapshot) {
-      if (!snapshot.hasData)
-        return const Scaffold(body: Center(child: CircularProgressIndicator()));
-      final values = snapshot.data!;
-      final tx = values[0] as List<TallyTransaction>;
-      final accounts = values[1] as List<Account>;
-      final symbol = values[2] as String;
-      final budget = int.tryParse(values[3] as String? ?? '0') ?? 0;
-      final review = values[4] as List<TallyTransaction>;
-      final spent = values[5] as int;
-      final balances = values[6] as Map<int, int>;
-      final detections = values[7] as List<DetectedAccount>;
-      final balance = accounts
-          .where((a) => a.kind == AccountKind.bank)
-          .fold<int>(0, (sum, a) => sum + (balances[a.id] ?? 0));
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: Text(title), actions: actions),
+    body: ListenableBuilder(
+      listenable: appState,
+      builder: (context, _) => !appState.loaded
+          ? const Center(child: CircularProgressIndicator())
+          : RefreshIndicator(
+              onRefresh: appState.load,
+              child: builder(context, appState),
+            ),
+    ),
+  );
+}
+
+class HomeScreen extends StatelessWidget {
+  const HomeScreen({super.key, required this.onOpenInsights});
+  final VoidCallback onOpenInsights;
+
+  @override
+  Widget build(BuildContext context) => TallyPage(
+    title: 'Tally',
+    builder: (context, state) {
       final scheme = Theme.of(context).colorScheme;
-      final lowAccounts = accounts.where((a) {
-        final min = a.minBalanceMinor;
-        return a.kind == AccountKind.bank &&
-            min != null &&
-            (balances[a.id] ?? 0) < min;
-      }).toList();
-      return Scaffold(
-        appBar: AppBar(title: const Text('Tally')),
-        body: ListView(
-          padding: EdgeInsets.fromLTRB(
-            20,
-            12,
-            20,
-            100 + MediaQuery.viewPaddingOf(context).bottom,
+      final symbol = state.symbol;
+      return ListView(
+        padding: EdgeInsets.fromLTRB(
+          20,
+          12,
+          20,
+          100 + MediaQuery.viewPaddingOf(context).bottom,
+        ),
+        children: [
+          BudgetHero(
+            spent: state.spent,
+            budget: state.budgetMinor,
+            period: state.period,
+            symbol: symbol,
+            onOpen: onOpenInsights,
           ),
-          children: [
-            Text('Available', style: Theme.of(context).textTheme.bodySmall),
-            Text(
-              money(balance, symbol),
-              style: Theme.of(context).textTheme.displayMedium,
-            ),
-            if (accounts.length > 1) ...[
-              const SizedBox(height: 12),
-              ...accounts.map((a) {
-                final accBalance = balances[a.id] ?? 0;
-                final low =
-                    a.kind == AccountKind.bank &&
-                    a.minBalanceMinor != null &&
-                    accBalance < a.minBalanceMinor!;
-                return Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 2),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        a.kind == AccountKind.card ? '${a.name} (card)' : a.name,
-                        style: Theme.of(context).textTheme.bodySmall,
-                      ),
-                      Text(
-                        money(accBalance, symbol),
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          fontFeatures: tabular,
-                          color: low ? scheme.error : null,
-                          fontWeight: low ? FontWeight.w600 : null,
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              }),
-            ],
-            if (detections.isNotEmpty) ...[
-              const SizedBox(height: 16),
-              ...detections.map(
-                (d) => _DetectedAccountCard(detection: d, onChanged: onChanged),
-              ),
-            ],
-            if (lowAccounts.isNotEmpty) ...[
-              const SizedBox(height: 16),
-              ...lowAccounts.map(
-                (a) => Card(
-                  color: scheme.errorContainer,
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Row(
-                      children: [
-                        Icon(
-                          Icons.warning_amber_rounded,
-                          color: scheme.onErrorContainer,
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Text(
-                            '${a.name} is below its minimum balance of '
-                            '${money(a.minBalanceMinor!, symbol)}',
-                            style: TextStyle(color: scheme.onErrorContainer),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            ],
-            const SizedBox(height: 24),
-            Card(
-              clipBehavior: Clip.antiAlias,
-              child: InkWell(
-                onTap: onOpenInsights,
-                child: Padding(
-                  padding: const EdgeInsets.all(20),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          const Text('This budget period'),
-                          Text(
-                            money(spent, symbol),
-                            style: const TextStyle(
-                              fontWeight: FontWeight.w700,
-                              fontFeatures: tabular,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 12),
-                      LinearProgressIndicator(
-                        value: budget > 0
-                            ? (spent / budget).clamp(0, 1).toDouble()
-                            : 0,
-                        color: spent > budget && budget > 0
-                            ? scheme.error
-                            : null,
-                      ),
-                      const SizedBox(height: 8),
-                      Text(
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                          color: spent > budget && budget > 0
-                              ? scheme.error
-                              : null,
-                        ),
-                        budget <= 0
-                            ? 'Set a monthly limit in Budget'
-                            : spent > budget
-                            ? '${money(spent - budget, symbol)} over ${money(budget, symbol)}'
-                            : '${money(budget - spent, symbol)} left of ${money(budget, symbol)}',
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-            if (review.isNotEmpty) ...[
-              const SizedBox(height: 28),
+          const SizedBox(height: 26),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('Available', style: Theme.of(context).textTheme.bodySmall),
               Text(
-                'Needs review',
-                style: Theme.of(context).textTheme.titleLarge,
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'Tally wasn\'t sure how to label these.',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-              ...review.map(
-                (t) => TransactionTile(
-                  transaction: t,
-                  symbol: symbol,
-                  onTap: () =>
-                      showTransactionSheet(context, onChanged, existing: t),
-                ),
+                money(state.totalBalance, symbol),
+                style: Theme.of(context).textTheme.titleMedium
+                    ?.copyWith(fontFeatures: tabular),
               ),
             ],
-            const SizedBox(height: 28),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  'Recent activity',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                TextButton(onPressed: onChanged, child: const Text('Refresh')),
-              ],
-            ),
-            ...tx.map(
-              (t) => TransactionTile(
-                transaction: t,
-                symbol: symbol,
-                onTap: () =>
-                    showTransactionSheet(context, onChanged, existing: t),
+          ),
+          const SizedBox(height: 10),
+          AccountRail(
+            accounts: state.accounts,
+            balances: state.balances,
+            symbol: symbol,
+          ),
+          if (state.detections.isNotEmpty) ...[
+            const SizedBox(height: 18),
+            ...state.detections.map(
+              (d) => Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: DetectedAccountCard(detection: d),
               ),
             ),
           ],
-        ),
+          ...state.lowAccounts.map(
+            (a) => Padding(
+              padding: const EdgeInsets.only(top: 18),
+              child: Card(
+                color: scheme.errorContainer,
+                child: Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: Row(
+                    children: [
+                      Icon(
+                        Icons.warning_amber_rounded,
+                        color: scheme.onErrorContainer,
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          '${a.name} is below its minimum balance of '
+                          '${money(a.minBalanceMinor!, symbol)}',
+                          style: TextStyle(color: scheme.onErrorContainer),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+          if (state.review.isNotEmpty) ...[
+            const SizedBox(height: 28),
+            Text('Needs review', style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 4),
+            Text(
+              "Tally wasn't sure how to label these.",
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            ...state.review.map(
+              (t) => TransactionTile(
+                transaction: t,
+                symbol: symbol,
+                onTap: () => showTransactionSheet(context, existing: t),
+              ),
+            ),
+          ],
+          const SizedBox(height: 28),
+          Text(
+            'Recent activity',
+            style: Theme.of(context).textTheme.titleLarge,
+          ),
+          ...state.ledger
+              .take(6)
+              .map(
+                (t) => TransactionTile(
+                  transaction: t,
+                  symbol: symbol,
+                  onTap: () => showTransactionSheet(context, existing: t),
+                ),
+              ),
+        ],
       );
     },
   );
 }
 
+/// The screen's one loud element: what this period has cost so far, the limit
+/// it is running against, and a marker for where an even pace would have you
+/// by today. Tapping opens Insights, which breaks the same period down.
+class BudgetHero extends StatelessWidget {
+  const BudgetHero({
+    super.key,
+    required this.spent,
+    required this.budget,
+    required this.period,
+    required this.symbol,
+    required this.onOpen,
+  });
+  final int spent;
+  final int budget;
+  final BudgetPeriod period;
+  final String symbol;
+  final VoidCallback onOpen;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    final now = DateTime.now();
+    final pace = budgetPace(period, now);
+    final over = budget > 0 && spent > budget;
+    final daysLeft = period.end.difference(now).inDays;
+    return InkWell(
+      onTap: onOpen,
+      borderRadius: BorderRadius.circular(Corners.card),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                'Spent since ${_dayMonth(period.start)}',
+                style: text.bodySmall,
+              ),
+              Text(
+                daysLeft <= 0
+                    ? 'Last day'
+                    : daysLeft == 1
+                    ? '1 day left'
+                    : '$daysLeft days left',
+                style: text.bodySmall,
+              ),
+            ],
+          ),
+          const SizedBox(height: 2),
+          // Seven-figure spends would run off the edge at this size.
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(
+              money(spent, symbol),
+              maxLines: 1,
+              style: text.displayMedium?.copyWith(
+                color: over ? scheme.error : null,
+              ),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            budget <= 0
+                ? 'Set a limit in Budget to track this'
+                : over
+                ? '${money(spent - budget, symbol)} over ${moneyShort(budget, symbol)}'
+                : '${money(budget - spent, symbol)} left of ${moneyShort(budget, symbol)}',
+            style: text.bodyMedium?.copyWith(
+              color: over ? scheme.error : scheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 14),
+          PaceBar(
+            fraction: budget > 0 ? (spent / budget).clamp(0, 1).toDouble() : 0,
+            pace: budget > 0 ? pace : null,
+            over: over,
+          ),
+          if (budget > 0) ...[
+            const SizedBox(height: 8),
+            Text(
+              'An even pace puts you at ${moneyShort((budget * pace).round(), symbol)} by today',
+              style: text.bodySmall,
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// The budget bar. [pace] draws the marker for an even spend across the
+/// period, which is the whole point of the bar: the fill alone says how much
+/// is gone, not whether that is early or late.
+class PaceBar extends StatelessWidget {
+  const PaceBar({
+    super.key,
+    required this.fraction,
+    required this.pace,
+    this.over = false,
+  });
+  final double fraction;
+  final double? pace;
+  final bool over;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return LayoutBuilder(
+      builder: (context, constraints) => SizedBox(
+        height: 14,
+        child: Stack(
+          children: [
+            Container(
+              decoration: BoxDecoration(
+                color: scheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(7),
+              ),
+            ),
+            FractionallySizedBox(
+              widthFactor: fraction == 0 ? 0.001 : fraction,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: over ? scheme.error : scheme.primary,
+                  borderRadius: BorderRadius.circular(7),
+                ),
+              ),
+            ),
+            if (pace != null)
+              Positioned(
+                left: (constraints.maxWidth - 4) * pace!.clamp(0.0, 1.0),
+                top: -3,
+                bottom: -3,
+                child: Container(
+                  width: 4,
+                  decoration: BoxDecoration(
+                    color: scheme.onSurface,
+                    borderRadius: BorderRadius.circular(2),
+                    border: Border.all(color: scheme.surface, width: 1),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Accounts as a row of cards you can push along, each opening its own sheet.
+/// A balance is a thing you hold, so it gets an object to sit on; the ledger
+/// rows below stay a list.
+class AccountRail extends StatelessWidget {
+  const AccountRail({
+    super.key,
+    required this.accounts,
+    required this.balances,
+    required this.symbol,
+  });
+  final List<Account> accounts;
+  final Map<int, int> balances;
+  final String symbol;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      height: 84,
+      child: ListView.separated(
+        scrollDirection: Axis.horizontal,
+        clipBehavior: Clip.none,
+        itemCount: accounts.length + 1,
+        separatorBuilder: (_, _) => const SizedBox(width: 10),
+        itemBuilder: (context, index) {
+          if (index == accounts.length)
+            return OutlinedButton(
+              onPressed: () => showAccountSheet(context),
+              child: const Text('Add account'),
+            );
+          final account = accounts[index];
+          final balance = balances[account.id] ?? 0;
+          final low =
+              account.kind == AccountKind.bank &&
+              account.minBalanceMinor != null &&
+              balance < account.minBalanceMinor!;
+          return SizedBox(
+            width: 152,
+            child: Card(
+              clipBehavior: Clip.antiAlias,
+              child: InkWell(
+                onTap: () => showAccountSheet(context, existing: account),
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(
+                            account.kind == AccountKind.card
+                                ? Icons.credit_card_rounded
+                                : Icons.account_balance_rounded,
+                            size: 15,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              account.name,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: text.bodySmall,
+                            ),
+                          ),
+                        ],
+                      ),
+                      FittedBox(
+                        fit: BoxFit.scaleDown,
+                        alignment: Alignment.centerLeft,
+                        child: Text(
+                          money(balance, symbol),
+                          maxLines: 1,
+                          style: text.titleMedium?.copyWith(
+                            fontFeatures: tabular,
+                            color: low ? scheme.error : null,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+const _months = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+];
+
+String _dayMonth(DateTime date) => '${date.day} ${_months[date.month - 1]}';
+
 /// Quiet prompt for an untracked (bank, last4) pair seen enough in SMS to be
 /// worth naming as an account or card.
-class _DetectedAccountCard extends StatelessWidget {
-  const _DetectedAccountCard({required this.detection, required this.onChanged});
+class DetectedAccountCard extends StatelessWidget {
+  const DetectedAccountCard({super.key, required this.detection});
   final DetectedAccount detection;
-  final VoidCallback onChanged;
 
   Future<void> _add(BuildContext context) async {
     final db = TallyDatabase.instance;
@@ -599,7 +797,7 @@ class _DetectedAccountCard extends StatelessWidget {
     );
     await db.linkSelfTransfers();
     await db.dismissDetection(detection.bank, detection.last4);
-    onChanged();
+    refreshApp();
   }
 
   Future<void> _dismiss() async {
@@ -607,7 +805,7 @@ class _DetectedAccountCard extends StatelessWidget {
       detection.bank,
       detection.last4,
     );
-    onChanged();
+    refreshApp();
   }
 
   @override
@@ -617,10 +815,18 @@ class _DetectedAccountCard extends StatelessWidget {
       child: Row(
         children: [
           Expanded(
-            child: Text(
-              'Found ${detection.suggestedName} in ${detection.messageCount} '
-              'messages',
-              style: Theme.of(context).textTheme.bodyMedium,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  detection.suggestedName,
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                Text(
+                  'Seen in ${detection.messageCount} messages',
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
             ),
           ),
           TextButton(onPressed: _dismiss, child: const Text('Dismiss')),
@@ -634,93 +840,131 @@ class _DetectedAccountCard extends StatelessWidget {
   );
 }
 
-const _transactionsPageSize = 200;
-
-class TransactionsScreen extends StatefulWidget {
-  const TransactionsScreen({super.key, required this.onChanged});
-  final VoidCallback onChanged;
-  @override
-  State<TransactionsScreen> createState() => _TransactionsScreenState();
-}
-
-class _TransactionsScreenState extends State<TransactionsScreen> {
-  int _limit = _transactionsPageSize;
-  late Future<List<Object?>> _future;
+class TransactionsScreen extends StatelessWidget {
+  const TransactionsScreen({super.key});
 
   @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  void _load() => _future = Future.wait([
-    TallyDatabase.instance.transactions(limit: _limit),
-    TallyDatabase.instance.currency(),
-  ]);
-
-  void _loadMore() => setState(() {
-    _limit += _transactionsPageSize;
-    _load();
-  });
-
-  @override
-  Widget build(BuildContext context) => FutureBuilder<List<Object?>>(
-    future: _future,
-    builder: (context, snapshot) {
-      if (!snapshot.hasData)
-        return const Scaffold(body: Center(child: CircularProgressIndicator()));
-      final transactions = snapshot.data![0] as List<TallyTransaction>;
-      final symbol = snapshot.data![1] as String;
-      final canLoadMore = transactions.length >= _limit;
-      return Scaffold(
-        appBar: AppBar(title: const Text('Activity')),
-        body: transactions.isEmpty
-            ? const Center(child: Text('No transactions yet.'))
-            : ListView.builder(
-                padding: EdgeInsets.fromLTRB(
-                  20,
-                  8,
-                  20,
-                  100 + MediaQuery.viewPaddingOf(context).bottom,
-                ),
-                itemCount: transactions.length + (canLoadMore ? 1 : 0),
-                itemBuilder: (_, index) {
-                  if (index == transactions.length)
-                    return Center(
-                      child: TextButton(
-                        onPressed: _loadMore,
-                        child: const Text('Load more'),
-                      ),
-                    );
-                  final transaction = transactions[index];
-                  return Dismissible(
-                    key: ValueKey(transaction.id),
-                    direction: DismissDirection.endToStart,
-                    onDismissed: (_) async {
-                      await TallyDatabase.instance.delete(transaction.id!);
-                      widget.onChanged();
-                    },
-                    background: Container(
-                      alignment: Alignment.centerRight,
-                      padding: const EdgeInsets.only(right: 24),
-                      color: Theme.of(context).colorScheme.errorContainer,
-                      child: const Icon(Icons.delete),
-                    ),
-                    child: TransactionTile(
-                      transaction: transaction,
-                      symbol: symbol,
-                      onTap: () => showTransactionSheet(
-                        context,
-                        widget.onChanged,
-                        existing: transaction,
-                      ),
-                    ),
-                  );
-                },
+  Widget build(BuildContext context) => TallyPage(
+    title: 'Activity',
+    builder: (context, state) {
+      final transactions = state.ledger;
+      if (transactions.isEmpty)
+        return ListView(
+          children: const [
+            SizedBox(height: 120),
+            Center(child: Text('No transactions yet.')),
+          ],
+        );
+      // What each day cost, so the list reads like a ledger rather than a
+      // stream. Money coming in is not spend and never joins the total.
+      final dayTotals = <DateTime, int>{};
+      for (final t in transactions)
+        if (t.kind == TransactionKind.expense)
+          dayTotals[_dayKey(t.occurredAt)] =
+              (dayTotals[_dayKey(t.occurredAt)] ?? 0) + t.amountMinor;
+      return ListView.builder(
+        padding: EdgeInsets.fromLTRB(
+          20,
+          8,
+          20,
+          100 + MediaQuery.viewPaddingOf(context).bottom,
+        ),
+        itemCount: transactions.length + (state.hasMore ? 1 : 0),
+        itemBuilder: (_, index) {
+          if (index == transactions.length)
+            return Center(
+              child: TextButton(
+                onPressed: () => unawaited(state.loadMore()),
+                child: const Text('Load more'),
               ),
+            );
+          final transaction = transactions[index];
+          final previous = index == 0 ? null : transactions[index - 1];
+          final tile = Dismissible(
+            key: ValueKey(transaction.id),
+            direction: DismissDirection.endToStart,
+            onDismissed: (_) async {
+              await TallyDatabase.instance.delete(transaction.id!);
+              refreshApp();
+            },
+            background: Container(
+              alignment: Alignment.centerRight,
+              padding: const EdgeInsets.only(right: 24),
+              color: Theme.of(context).colorScheme.errorContainer,
+              child: const Icon(Icons.delete),
+            ),
+            child: TransactionTile(
+              transaction: transaction,
+              symbol: state.symbol,
+              onTap: () => showTransactionSheet(context, existing: transaction),
+            ),
+          );
+          if (previous != null &&
+              _sameDay(previous.occurredAt, transaction.occurredAt))
+            return tile;
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _DayHeading(
+                date: transaction.occurredAt,
+                spent: dayTotals[_dayKey(transaction.occurredAt)] ?? 0,
+                symbol: state.symbol,
+                first: index == 0,
+              ),
+              tile,
+            ],
+          );
+        },
       );
     },
   );
+}
+
+DateTime _dayKey(DateTime at) => DateTime(at.year, at.month, at.day);
+
+bool _sameDay(DateTime a, DateTime b) => _dayKey(a) == _dayKey(b);
+
+const _weekdays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+/// Splits the ledger into days, each headed by what that day cost. The
+/// heading is the only place spend is summed outside the budget itself.
+class _DayHeading extends StatelessWidget {
+  const _DayHeading({
+    required this.date,
+    required this.spent,
+    required this.symbol,
+    required this.first,
+  });
+  final DateTime date;
+  final int spent;
+  final String symbol;
+  final bool first;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    final today = _dayKey(DateTime.now());
+    final day = _dayKey(date);
+    final label = day == today
+        ? 'Today'
+        : day == today.subtract(const Duration(days: 1))
+        ? 'Yesterday'
+        : '${_weekdays[date.weekday - 1]} ${_dayMonth(date)}';
+    return Padding(
+      padding: EdgeInsets.fromLTRB(0, first ? 4 : 22, 0, 2),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: text.titleMedium),
+          if (spent > 0)
+            Text(
+              money(spent, symbol),
+              style: text.bodySmall?.copyWith(fontFeatures: tabular),
+            ),
+        ],
+      ),
+    );
+  }
 }
 
 class TransactionTile extends StatelessWidget {
@@ -750,8 +994,11 @@ class TransactionTile extends StatelessWidget {
       ),
       title: Text(transaction.merchant),
       subtitle: Text(
-        '${transaction.category} · ${transaction.occurredAt.day}/${transaction.occurredAt.month}'
-        '${transaction.needsReview ? ' · tap to label' : ''}',
+        '${transaction.needsReview ? 'Needs a label' : transaction.category}'
+        ' · ${transaction.occurredAt.day}/${transaction.occurredAt.month}',
+        style: transaction.needsReview
+            ? TextStyle(color: scheme.primary, fontWeight: FontWeight.w700)
+            : null,
       ),
       trailing: Text(
         '$sign${money(transaction.amountMinor, symbol)}',
@@ -766,34 +1013,16 @@ class TransactionTile extends StatelessWidget {
 }
 
 class BudgetScreen extends StatefulWidget {
-  const BudgetScreen({super.key, required this.onChanged});
-  final VoidCallback onChanged;
+  const BudgetScreen({super.key});
   @override
   State<BudgetScreen> createState() => _BudgetScreenState();
 }
 
+/// The one screen with its own state: a text field the user is typing in.
+/// Everything else it shows comes from [appState].
 class _BudgetScreenState extends State<BudgetScreen> {
   final controller = TextEditingController();
-  String symbol = '₹';
-  bool loading = true;
-  int startDay = 1;
-  List<Account> accounts = const [];
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  Future<void> _load() async {
-    final db = TallyDatabase.instance;
-    controller.text =
-        ((int.tryParse(await db.setting('monthly_budget') ?? '0') ?? 0) / 100)
-            .toStringAsFixed(2);
-    symbol = await db.currency();
-    startDay = await db.budgetStartDay();
-    accounts = await db.accounts();
-    if (mounted) setState(() => loading = false);
-  }
+  bool _seeded = false;
 
   @override
   void dispose() {
@@ -802,120 +1031,111 @@ class _BudgetScreenState extends State<BudgetScreen> {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('Budget')),
-    body: loading
-        ? const Center(child: CircularProgressIndicator())
-        : ListView(
-            padding: EdgeInsets.fromLTRB(
-              20,
-              20,
-              20,
-              20 + MediaQuery.viewPaddingOf(context).bottom,
-            ),
-            children: [
-              Text(
-                'One number is enough.',
-                style: Theme.of(context).textTheme.headlineSmall
-                    ?.copyWith(fontWeight: FontWeight.w700),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'Set a gentle spending limit for the period. Tally will keep the rest simple.',
-              ),
-              const SizedBox(height: 28),
-              TextField(
-                controller: controller,
-                keyboardType: const TextInputType.numberWithOptions(
-                  decimal: true,
-                ),
-                decoration: InputDecoration(
-                  prefixText: '$symbol ',
-                  labelText: 'Spending limit',
-                ),
-              ),
-              const SizedBox(height: 16),
-              FilledButton(
-                onPressed: () async {
-                  await TallyDatabase.instance.setSetting(
-                    'monthly_budget',
-                    '${parseMoney(controller.text) ?? 0}',
-                  );
-                  widget.onChanged();
-                  if (mounted)
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('Budget saved')),
-                    );
-                },
-                child: const Text('Save budget'),
-              ),
-              const SizedBox(height: 28),
-              Text(
-                'Period start day',
-                style: Theme.of(context).textTheme.titleMedium,
-              ),
-              const SizedBox(height: 4),
-              Text(
-                'Your budget period runs from this day of the month to the day before it next month.',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-              const SizedBox(height: 12),
-              DropdownButtonFormField<int>(
-                initialValue: startDay,
-                decoration: const InputDecoration(labelText: 'Starts on'),
-                items: List.generate(
-                  28,
-                  (i) =>
-                      DropdownMenuItem(value: i + 1, child: Text('${i + 1}')),
-                ),
-                onChanged: (v) async {
-                  if (v == null) return;
-                  setState(() => startDay = v);
-                  await TallyDatabase.instance.setSetting(
-                    'budget_start_day',
-                    '$v',
-                  );
-                  widget.onChanged();
-                },
-              ),
-              if (accounts.isNotEmpty) ...[
-                const SizedBox(height: 28),
-                Text(
-                  'Accounts',
-                  style: Theme.of(context).textTheme.titleMedium,
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  "Turn an account off to leave its spending out of the budget.",
-                  style: Theme.of(context).textTheme.bodySmall,
-                ),
-                ...accounts.map(
-                  (a) => SwitchListTile(
-                    contentPadding: EdgeInsets.zero,
-                    title: Text(a.name),
-                    subtitle: const Text('Count in budget'),
-                    value: a.inBudget,
-                    onChanged: (v) async {
-                      final updated = a.copyWith(inBudget: v);
-                      await TallyDatabase.instance.updateAccount(updated);
-                      setState(
-                        () => accounts = accounts
-                            .map((x) => x.id == a.id ? updated : x)
-                            .toList(),
-                      );
-                      widget.onChanged();
-                    },
-                  ),
-                ),
-              ],
-            ],
+  Widget build(BuildContext context) => TallyPage(
+    title: 'Budget',
+    builder: (context, state) {
+      // Fill the field from the saved limit once, then leave it alone - a
+      // refresh mid-edit must not overwrite what is being typed.
+      if (!_seeded) {
+        _seeded = true;
+        controller.text = (state.budgetMinor / 100).toStringAsFixed(2);
+      }
+      return ListView(
+        padding: EdgeInsets.fromLTRB(
+          20,
+          20,
+          20,
+          20 + MediaQuery.viewPaddingOf(context).bottom,
+        ),
+        children: [
+          Text(
+            'One number is enough.',
+            style: Theme.of(context).textTheme.headlineSmall
+                ?.copyWith(fontWeight: FontWeight.w700),
           ),
+          const SizedBox(height: 8),
+          const Text(
+            'Set a gentle spending limit for the period. Tally will keep the rest simple.',
+          ),
+          const SizedBox(height: 28),
+          TextField(
+            controller: controller,
+            keyboardType: const TextInputType.numberWithOptions(decimal: true),
+            decoration: InputDecoration(
+              prefixText: '${state.symbol} ',
+              labelText: 'Spending limit',
+            ),
+          ),
+          const SizedBox(height: 16),
+          FilledButton(
+            onPressed: () async {
+              await TallyDatabase.instance.setSetting(
+                'monthly_budget',
+                '${parseMoney(controller.text) ?? 0}',
+              );
+              refreshApp();
+              if (context.mounted)
+                ScaffoldMessenger.of(
+                  context,
+                ).showSnackBar(const SnackBar(content: Text('Budget saved')));
+            },
+            child: const Text('Save budget'),
+          ),
+          const SizedBox(height: 28),
+          Text(
+            'Period start day',
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Your budget period runs from this day of the month to the day before it next month.',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<int>(
+            initialValue: state.startDay,
+            decoration: const InputDecoration(labelText: 'Starts on'),
+            items: List.generate(
+              28,
+              (i) => DropdownMenuItem(value: i + 1, child: Text('${i + 1}')),
+            ),
+            onChanged: (v) async {
+              if (v == null) return;
+              await TallyDatabase.instance.setSetting('budget_start_day', '$v');
+              refreshApp();
+            },
+          ),
+          if (state.accounts.isNotEmpty) ...[
+            const SizedBox(height: 28),
+            Text('Accounts', style: Theme.of(context).textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              'Turn an account off to leave its spending out of the budget.',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            ...state.accounts.map(
+              (a) => SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: Text(a.name),
+                subtitle: const Text('Count in budget'),
+                value: a.inBudget,
+                onChanged: (v) async {
+                  await TallyDatabase.instance.updateAccount(
+                    a.copyWith(inBudget: v),
+                  );
+                  refreshApp();
+                },
+              ),
+            ),
+          ],
+        ],
+      );
+    },
   );
 }
 
 class SettingsScreen extends StatefulWidget {
-  const SettingsScreen({super.key, required this.onChanged});
-  final VoidCallback onChanged;
+  const SettingsScreen({super.key});
   @override
   State<SettingsScreen> createState() => _SettingsScreenState();
 }
@@ -931,7 +1151,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
     final report = await ingestHistoricSms();
     await recategorizeReviewQueue();
-    widget.onChanged();
+    refreshApp();
     if (!mounted) return;
     setState(() => _smsStatus = _describeIngest(report));
   }
@@ -960,7 +1180,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     if (confirmed != true) return;
     final report = await rereadStoredSms();
     await recategorizeReviewQueue();
-    widget.onChanged();
+    refreshApp();
     if (!mounted) return;
     setState(() => _smsStatus = _describeIngest(report));
   }
@@ -989,13 +1209,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
       accountId: account.id!,
       source: source.toLowerCase().endsWith('.pdf') ? 'pdf' : 'csv',
     );
-    widget.onChanged();
+    refreshApp();
     _snack('$inserted transactions imported to ${account.name}');
   }
 
   /// Skips the picker entirely when there is only one account to target.
   Future<Account?> _chooseAccount() async {
-    final accounts = await TallyDatabase.instance.accounts();
+    final accounts = appState.accounts;
     if (accounts.isEmpty) {
       _snack('Add an account first.');
       return null;
@@ -1047,99 +1267,104 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   @override
-  Widget build(BuildContext context) => Scaffold(
-    appBar: AppBar(title: const Text('Settings')),
-    body: FutureBuilder<List<Account>>(
-      future: TallyDatabase.instance.accounts(),
-      builder: (context, snapshot) {
-        final accounts = snapshot.data ?? const [];
-        return ListView(
-          padding: EdgeInsets.fromLTRB(
-            12,
-            12,
-            12,
-            12 + MediaQuery.viewPaddingOf(context).bottom,
+  Widget build(BuildContext context) => TallyPage(
+    title: 'Settings',
+    builder: (context, state) {
+      final accounts = state.accounts;
+      final balances = state.balances;
+      final symbol = state.symbol;
+      return ListView(
+        padding: EdgeInsets.fromLTRB(
+          12,
+          12,
+          12,
+          12 + MediaQuery.viewPaddingOf(context).bottom,
+        ),
+        children: [
+          const ListTile(
+            title: Text('Privacy'),
+            subtitle: Text('Your ledger stays on this device.'),
           ),
-          children: [
-            const ListTile(
-              title: Text('Privacy'),
-              subtitle: Text('Your ledger stays on this device.'),
-            ),
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(
-                    'Accounts',
-                    style: Theme.of(context).textTheme.titleMedium,
-                  ),
-                  TextButton(
-                    onPressed: () => _showAccountSheet(context),
-                    child: const Text('Add'),
-                  ),
-                ],
-              ),
-            ),
-            ...accounts.map(
-              (a) => ListTile(
-                leading: const Icon(Icons.account_balance_outlined),
-                title: Text(a.name),
-                subtitle: Text(
-                  a.last4.isEmpty ? 'No linked digits' : '···· ${a.last4}',
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  'Accounts',
+                  style: Theme.of(context).textTheme.titleMedium,
                 ),
-                trailing: IconButton(
-                  icon: const Icon(Icons.delete_outline),
-                  onPressed: () => _confirmDeleteAccount(context, a),
+                TextButton(
+                  onPressed: () => showAccountSheet(context),
+                  child: const Text('Add'),
                 ),
-                onTap: () => _showAccountSheet(context, existing: a),
+              ],
+            ),
+          ),
+          ...accounts.map(
+            (a) => ListTile(
+              leading: Icon(
+                a.kind == AccountKind.card
+                    ? Icons.credit_card_outlined
+                    : Icons.account_balance_outlined,
               ),
-            ),
-            const Divider(height: 32),
-            ValueListenableBuilder<SyncStatus?>(
-              valueListenable: smsSyncStatus,
-              builder: (context, status, _) => Column(
-                children: [
-                  ListTile(
-                    leading: const Icon(Icons.sms_outlined),
-                    title: const Text('Bank SMS'),
-                    subtitle: Text(
-                      _smsStatus.isEmpty
-                          ? 'Scan your inbox for past transactions'
-                          : _smsStatus,
-                    ),
-                    trailing: FilledButton(
-                      onPressed: status == null ? _scanSms : null,
-                      child: const Text('Scan SMS inbox'),
-                    ),
-                  ),
-                  ListTile(
-                    leading: const Icon(Icons.restart_alt_outlined),
-                    title: const Text('Re-read SMS'),
-                    subtitle: const Text('Fix wrongly parsed SMS transactions'),
-                    onTap: status == null
-                        ? () => _confirmRereadSms(context)
-                        : null,
-                  ),
-                ],
+              title: Text(a.name),
+              subtitle: Text(
+                '${money(balances[a.id] ?? 0, symbol)}'
+                '${a.last4.isEmpty ? '' : ' · ···· ${a.last4}'}'
+                '${a.inBudget ? '' : ' · not in budget'}',
               ),
+              trailing: IconButton(
+                icon: const Icon(Icons.delete_outline),
+                onPressed: () => _confirmDeleteAccount(context, a),
+              ),
+              onTap: () => showAccountSheet(context, existing: a),
             ),
-            ListTile(
-              leading: const Icon(Icons.file_upload_outlined),
-              title: const Text('Import statement'),
-              subtitle: const Text('Choose a CSV or PDF, or paste rows'),
-              onTap: _importStatement,
+          ),
+          const Divider(height: 32),
+          ValueListenableBuilder<SyncStatus?>(
+            valueListenable: smsSyncStatus,
+            builder: (context, status, _) => Column(
+              children: [
+                ListTile(
+                  leading: const Icon(Icons.sms_outlined),
+                  title: const Text('Bank SMS'),
+                  subtitle: Text(
+                    _smsStatus.isEmpty
+                        ? 'Scan your inbox for past transactions'
+                        : _smsStatus,
+                  ),
+                  trailing: FilledButton(
+                    onPressed: status == null ? _scanSms : null,
+                    child: const Text('Scan SMS inbox'),
+                  ),
+                ),
+                ListTile(
+                  leading: const Icon(Icons.restart_alt_outlined),
+                  title: const Text('Re-read SMS'),
+                  subtitle: const Text('Fix wrongly parsed SMS transactions'),
+                  onTap: status == null
+                      ? () => _confirmRereadSms(context)
+                      : null,
+                ),
+              ],
             ),
-            ListTile(
-              leading: const Icon(Icons.file_download_outlined),
-              title: const Text('Export transactions'),
-              subtitle: const Text('Save every transaction as a CSV file'),
-              onTap: _exportTransactions,
-            ),
-          ],
-        );
-      },
-    ),
+          ),
+          ListTile(
+            leading: const Icon(Icons.file_upload_outlined),
+            title: const Text('Import statement'),
+            subtitle: const Text('Choose a CSV or PDF, or paste rows'),
+            onTap: _importStatement,
+          ),
+          ListTile(
+            leading: const Icon(Icons.file_download_outlined),
+            title: const Text('Export transactions'),
+            subtitle: const Text('Save every transaction as a CSV file'),
+            onTap: _exportTransactions,
+          ),
+        ],
+      );
+    },
   );
 
   Future<void> _confirmDeleteAccount(BuildContext context, Account a) async {
@@ -1164,165 +1389,8 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
     if (confirmed == true) {
       await TallyDatabase.instance.deleteAccount(a.id!);
-      widget.onChanged();
-      setState(() {});
+      refreshApp();
     }
-  }
-
-  void _showAccountSheet(BuildContext context, {Account? existing}) {
-    final name = TextEditingController(text: existing?.name ?? '');
-    final last4 = TextEditingController(text: existing?.last4 ?? '');
-    final opening = TextEditingController(
-      text: existing == null
-          ? ''
-          : ((existing.reportedBalanceMinor ?? existing.openingBalanceMinor) /
-                    100)
-                .toStringAsFixed(2),
-    );
-    final initialBalance = opening.text;
-    final minBalance = TextEditingController(
-      text: existing?.minBalanceMinor == null
-          ? ''
-          : (existing!.minBalanceMinor! / 100).toStringAsFixed(2),
-    );
-    var inBudget = existing?.inBudget ?? true;
-    var kind = existing?.kind ?? AccountKind.bank;
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      builder: (sheetContext) => StatefulBuilder(
-        builder: (context, setSheetState) => Padding(
-          padding: EdgeInsets.fromLTRB(
-            20,
-            20,
-            20,
-            sheetBottomInset(context) + 20,
-          ),
-          child: SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  existing == null ? 'Add account' : 'Edit account',
-                  style: Theme.of(context).textTheme.titleLarge,
-                ),
-                const SizedBox(height: 16),
-                TextField(
-                  controller: name,
-                  autofocus: true,
-                  decoration: const InputDecoration(labelText: 'Account name'),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: last4,
-                  maxLength: 4,
-                  keyboardType: TextInputType.number,
-                  decoration: const InputDecoration(
-                    labelText: 'Last 4 digits (optional)',
-                    counterText: '',
-                  ),
-                ),
-                const SizedBox(height: 10),
-                SegmentedButton<AccountKind>(
-                  segments: const [
-                    ButtonSegment(
-                      value: AccountKind.bank,
-                      label: Text('Bank account'),
-                    ),
-                    ButtonSegment(
-                      value: AccountKind.card,
-                      label: Text('Credit card'),
-                    ),
-                  ],
-                  selected: {kind},
-                  onSelectionChanged: (v) => setSheetState(() => kind = v.first),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: opening,
-                  keyboardType: const TextInputType.numberWithOptions(
-                    decimal: true,
-                  ),
-                  decoration: const InputDecoration(
-                    labelText: 'Balance',
-                    helperText: 'What your bank shows right now',
-                  ),
-                ),
-                const SizedBox(height: 10),
-                TextField(
-                  controller: minBalance,
-                  keyboardType: const TextInputType.numberWithOptions(
-                    decimal: true,
-                  ),
-                  decoration: const InputDecoration(
-                    labelText: 'Minimum balance (optional)',
-                    helperText:
-                        'Tally warns you when the balance dips below this',
-                  ),
-                ),
-                SwitchListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: const Text('Count in budget'),
-                  value: inBudget,
-                  onChanged: (v) => setSheetState(() => inBudget = v),
-                ),
-                const SizedBox(height: 16),
-                SizedBox(
-                  width: double.infinity,
-                  child: FilledButton(
-                    onPressed: () async {
-                      if (name.text.trim().isEmpty) return;
-                      final typed = parseMoney(opening.text) ?? 0;
-                      // A changed balance means "this is what I have now".
-                      final reanchor =
-                          existing == null || opening.text != initialBalance;
-                      final account = Account(
-                        id: existing?.id,
-                        name: name.text.trim(),
-                        last4: last4.text.trim(),
-                        openingBalanceMinor:
-                            existing?.openingBalanceMinor ?? typed,
-                        reportedBalanceMinor: reanchor
-                            ? typed
-                            : existing.reportedBalanceMinor,
-                        reportedAt: reanchor
-                            ? DateTime.now()
-                            : existing.reportedAt,
-                        inBudget: inBudget,
-                        minBalanceMinor: parseMoney(minBalance.text),
-                        kind: kind,
-                      );
-                      if (existing == null) {
-                        await TallyDatabase.instance.addAccountAndClaim(
-                          account,
-                        );
-                        await TallyDatabase.instance.linkSelfTransfers();
-                      } else {
-                        await TallyDatabase.instance.updateAccount(account);
-                        if (account.last4.isNotEmpty &&
-                            account.last4 != existing.last4) {
-                          await TallyDatabase.instance.claimOrphans(
-                            account.id!,
-                            last4: account.last4,
-                          );
-                          await TallyDatabase.instance.linkSelfTransfers();
-                        }
-                      }
-                      if (sheetContext.mounted) Navigator.pop(sheetContext);
-                      widget.onChanged();
-                      setState(() {});
-                    },
-                    child: const Text('Save account'),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
   }
 
   void _showPasteCsvSheet(BuildContext context) {
@@ -1381,23 +1449,182 @@ String _describeIngest(IngestReport report) =>
     '${report.ignored} skipped'
     '${report.failed > 0 ? ', ${report.failed} failed' : ''}';
 
+/// Add or edit an account: name, the digits its SMS quote, kind, what the
+/// bank shows right now, and whether it counts toward the budget.
+void showAccountSheet(BuildContext context, {Account? existing}) {
+  final name = TextEditingController(text: existing?.name ?? '');
+  final last4 = TextEditingController(text: existing?.last4 ?? '');
+  final opening = TextEditingController(
+    text: existing == null
+        ? ''
+        : ((existing.reportedBalanceMinor ?? existing.openingBalanceMinor) /
+                  100)
+              .toStringAsFixed(2),
+  );
+  final initialBalance = opening.text;
+  final minBalance = TextEditingController(
+    text: existing?.minBalanceMinor == null
+        ? ''
+        : (existing!.minBalanceMinor! / 100).toStringAsFixed(2),
+  );
+  var inBudget = existing?.inBudget ?? true;
+  var kind = existing?.kind ?? AccountKind.bank;
+  showModalBottomSheet(
+    context: context,
+    isScrollControlled: true,
+    useSafeArea: true,
+    builder: (sheetContext) => StatefulBuilder(
+      builder: (context, setSheetState) => Padding(
+        padding: EdgeInsets.fromLTRB(
+          20,
+          20,
+          20,
+          sheetBottomInset(context) + 20,
+        ),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                existing == null ? 'Add account' : 'Edit account',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: name,
+                autofocus: true,
+                decoration: const InputDecoration(labelText: 'Account name'),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: last4,
+                maxLength: 40,
+                keyboardType: TextInputType.text,
+                decoration: const InputDecoration(
+                  labelText: 'Last 4 digits (optional)',
+                  hintText: 'Add debit card digits too, space separated',
+                  counterText: '',
+                ),
+              ),
+              const SizedBox(height: 10),
+              SegmentedButton<AccountKind>(
+                segments: const [
+                  ButtonSegment(
+                    value: AccountKind.bank,
+                    label: Text('Bank account'),
+                  ),
+                  ButtonSegment(
+                    value: AccountKind.card,
+                    label: Text('Credit card'),
+                  ),
+                ],
+                selected: {kind},
+                onSelectionChanged: (v) => setSheetState(() => kind = v.first),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: opening,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                decoration: const InputDecoration(
+                  labelText: 'Balance',
+                  helperText: 'What your bank shows right now',
+                ),
+              ),
+              const SizedBox(height: 10),
+              TextField(
+                controller: minBalance,
+                keyboardType: const TextInputType.numberWithOptions(
+                  decimal: true,
+                ),
+                decoration: const InputDecoration(
+                  labelText: 'Minimum balance (optional)',
+                  helperText:
+                      'Tally warns you when the balance dips below this',
+                ),
+              ),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text('Count in budget'),
+                value: inBudget,
+                onChanged: (v) => setSheetState(() => inBudget = v),
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: FilledButton(
+                  onPressed: () async {
+                    if (name.text.trim().isEmpty) return;
+                    final typed = parseMoney(opening.text) ?? 0;
+                    // A changed balance means "this is what I have now".
+                    final reanchor =
+                        existing == null || opening.text != initialBalance;
+                    final account = Account(
+                      id: existing?.id,
+                      name: name.text.trim(),
+                      last4: last4.text.trim(),
+                      openingBalanceMinor:
+                          existing?.openingBalanceMinor ?? typed,
+                      reportedBalanceMinor: reanchor
+                          ? typed
+                          : existing.reportedBalanceMinor,
+                      reportedAt: reanchor
+                          ? DateTime.now()
+                          : existing.reportedAt,
+                      inBudget: inBudget,
+                      minBalanceMinor: parseMoney(minBalance.text),
+                      kind: kind,
+                    );
+                    if (existing == null) {
+                      await TallyDatabase.instance.addAccountAndClaim(account);
+                      await TallyDatabase.instance.linkSelfTransfers();
+                    } else {
+                      await TallyDatabase.instance.updateAccount(account);
+                      if (account.last4.isNotEmpty &&
+                          account.last4 != existing.last4) {
+                        await TallyDatabase.instance.claimOrphans(
+                          account.id!,
+                          last4: account.last4,
+                        );
+                        await TallyDatabase.instance.linkSelfTransfers();
+                      }
+                    }
+                    if (sheetContext.mounted) Navigator.pop(sheetContext);
+                    refreshApp();
+                  },
+                  child: const Text('Save account'),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
 /// Bottom sheet for both adding a transaction and editing one (tap any
 /// tile). [existing] null means "add"; otherwise the sheet edits that row,
 /// offers delete, and re-runs [confirmCategory] when the category changes so
 /// the learner still sees the correction.
 void showTransactionSheet(
-  BuildContext context,
-  VoidCallback onSaved, {
+  BuildContext context, {
   TallyTransaction? existing,
 }) async {
-  final accounts = await TallyDatabase.instance.accounts();
+  // An SMS ingest can rebuild the page this tile sits on while the accounts
+  // load, which left the tap doing nothing at all. The root navigator and the
+  // messenger outlive any page, so the sheet still opens.
+  final navigator = Navigator.of(context, rootNavigator: true);
+  final messenger = ScaffoldMessenger.of(context);
+  final accounts = appState.accounts;
   if (accounts.isEmpty) {
-    if (context.mounted)
-      ScaffoldMessenger.of(context)
-          .showSnackBar(const SnackBar(content: Text('Add an account first')));
+    messenger.showSnackBar(
+      const SnackBar(content: Text('Add an account first')),
+    );
     return;
   }
-  if (!context.mounted) return;
 
   final merchant = TextEditingController(text: existing?.merchant ?? '');
   final amount = TextEditingController(
@@ -1412,7 +1639,7 @@ void showTransactionSheet(
   var exclude = existing?.excludeFromBudget ?? false;
 
   showModalBottomSheet(
-    context: context,
+    context: navigator.context,
     isScrollControlled: true,
     useSafeArea: true,
     builder: (sheetContext) => StatefulBuilder(
@@ -1562,13 +1789,15 @@ void showTransactionSheet(
                             : null,
                         clearTransferAccount: !isTransfer,
                       );
-                      if (!isTransfer && category != existing.category)
+                      if (!isTransfer &&
+                          (category != existing.category ||
+                              existing.needsReview))
                         await confirmCategory(updated, category);
                       else
                         await TallyDatabase.instance.updateTransaction(updated);
                     }
                     if (sheetContext.mounted) Navigator.pop(sheetContext);
-                    onSaved();
+                    refreshApp();
                   },
                   child: const Text('Save transaction'),
                 ),
@@ -1576,7 +1805,8 @@ void showTransactionSheet(
               if (existing?.smsBody?.isNotEmpty ?? false) ...[
                 const SizedBox(height: 8),
                 Theme(
-                  data: Theme.of(context).copyWith(dividerColor: Colors.transparent),
+                  data: Theme.of(context)
+                      .copyWith(dividerColor: Colors.transparent),
                   child: ExpansionTile(
                     tilePadding: EdgeInsets.zero,
                     title: const Text('Original message'),
@@ -1601,7 +1831,7 @@ void showTransactionSheet(
                     onPressed: () async {
                       await TallyDatabase.instance.delete(existing.id!);
                       if (sheetContext.mounted) Navigator.pop(sheetContext);
-                      onSaved();
+                      refreshApp();
                     },
                   ),
                 ),

@@ -41,7 +41,9 @@ bool isSelfTransferPair(TallyTransaction debit, TallyTransaction credit) {
 /// window around it instead of every credit in the ledger.
 List<TransferMatch> findSelfTransfers(List<TallyTransaction> rows) {
   final credits =
-      rows.where((t) => t.kind == TransactionKind.income && t.id != null).toList()
+      rows
+          .where((t) => t.kind == TransactionKind.income && t.id != null)
+          .toList()
         ..sort((a, b) => a.occurredAt.compareTo(b.occurredAt));
   final matches = <TransferMatch>[];
   final usedCredits = <int>{};

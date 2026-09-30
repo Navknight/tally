@@ -27,6 +27,14 @@ String _groupWestern(String units) {
   return groups.join(',');
 }
 
+/// [money] with the paise dropped, for figures where they are noise rather
+/// than fact: a spending limit, an even-pace target. Amounts the ledger owns
+/// always keep theirs.
+String moneyShort(int minor, String symbol) {
+  final full = money(minor, symbol);
+  return full.substring(0, full.length - 3);
+}
+
 /// Parses a user- or statement-supplied amount into minor units.
 ///
 /// Understands a leading or trailing minus, accountant parentheses, Indian

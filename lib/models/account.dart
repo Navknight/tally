@@ -93,11 +93,18 @@ class Account {
 /// True when two last-4-digit strings could name the same account or card:
 /// an exact match, or one ending in the other (a message that quoted more
 /// digits than another did, e.g. "XX3001" vs "3001"). Empty strings never
-/// match anything, including each other.
+/// match anything, including each other. Either side may list several
+/// numbers ("9644 9500"), so a debit card's digits can sit on the bank
+/// account it spends from.
 bool last4Matches(String a, String b) {
-  if (a.isEmpty || b.isEmpty) return false;
-  return a.endsWith(b) || b.endsWith(a);
+  for (final x in a.split(_digitSeparatorRegex))
+    for (final y in b.split(_digitSeparatorRegex))
+      if (x.isNotEmpty && y.isNotEmpty && (x.endsWith(y) || y.endsWith(x)))
+        return true;
+  return false;
 }
+
+final _digitSeparatorRegex = RegExp(r'[^0-9]+');
 
 /// Whether an orphan transaction (`accountLast4`/`bank` as parsed, no
 /// `accountId` yet) should be claimed by an account or detection identified

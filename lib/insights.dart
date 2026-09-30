@@ -4,122 +4,93 @@ import 'package:flutter/material.dart';
 import 'app/theme.dart';
 import 'core/budget_period.dart';
 import 'core/money.dart';
-import 'data/tally_database.dart';
-import 'main.dart' show TransactionTile;
-import 'models/transaction.dart';
+import 'main.dart' show TallyPage, TransactionTile;
 import 'models/categories.dart';
 
 /// Spending charts for the current budget period: category breakdown and a
 /// daily bar chart, with the budget's daily pace overlaid when one is set.
 class InsightsScreen extends StatelessWidget {
-  const InsightsScreen({super.key, required this.onChanged});
-  final VoidCallback onChanged;
+  const InsightsScreen({super.key});
 
   @override
-  Widget build(BuildContext context) => FutureBuilder<List<Object?>>(
-    future: () async {
-      final db = TallyDatabase.instance;
-      final startDay = await db.budgetStartDay();
-      final period = budgetPeriod(DateTime.now(), startDay);
-      return Future.wait([
-        Future.value(period),
-        db.spendByCategory(period),
-        db.dailySpend(period),
-        db.currency(),
-        db.setting('monthly_budget'),
-        db.budgetRowsPage(period),
-      ]);
-    }(),
-    builder: (context, snapshot) {
-      if (!snapshot.hasData)
-        return const Scaffold(body: Center(child: CircularProgressIndicator()));
-      final values = snapshot.data!;
-      final period = values[0] as BudgetPeriod;
-      final byCategory = values[1] as List<(String, int)>;
-      final byDay = values[2] as Map<DateTime, int>;
-      final symbol = values[3] as String;
-      final budget = int.tryParse(values[4] as String? ?? '0') ?? 0;
+  Widget build(BuildContext context) => TallyPage(
+    title: 'Insights',
+    builder: (context, state) {
+      final period = state.period;
+      final byCategory = state.byCategory;
+      final byDay = state.byDay;
+      final symbol = state.symbol;
+      final budget = state.budgetMinor;
       final total = byCategory.fold<int>(0, (sum, e) => sum + e.$2);
-      final (counted, countedTotal) =
-          values[5] as (List<TallyTransaction>, int);
-
-      return Scaffold(
-        appBar: AppBar(title: const Text('Insights')),
-        body: total == 0
-            ? const Center(
-                child: Padding(
-                  padding: EdgeInsets.all(32),
-                  child: Text(
-                    'No spending in this budget period yet. Add a transaction '
-                    'or import a statement to see charts here.',
-                    textAlign: TextAlign.center,
-                  ),
-                ),
-              )
-            : ListView(
-                padding: const EdgeInsets.fromLTRB(20, 12, 20, 100),
-                children: [
-                  Text(
-                    'By category',
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                  const SizedBox(height: 16),
-                  _CategoryDonut(
-                    byCategory: byCategory,
-                    total: total,
-                    symbol: symbol,
-                  ),
-                  const SizedBox(height: 12),
-                  ...byCategory.map(
-                    (e) => _CategoryLegendRow(
-                      category: e.$1,
-                      amountMinor: e.$2,
-                      symbol: symbol,
-                    ),
-                  ),
-                  const SizedBox(height: 28),
-                  Text(
-                    'Daily spend',
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                  const SizedBox(height: 4),
-                  Text(
-                    '${period.start.day}/${period.start.month} - '
-                    '${period.end.subtract(const Duration(days: 1)).day}/'
-                    '${period.end.subtract(const Duration(days: 1)).month}',
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                  const SizedBox(height: 16),
-                  SizedBox(
-                    height: 220,
-                    child: _DailyBarChart(
-                      period: period,
-                      byDay: byDay,
-                      budgetMinor: budget,
-                      symbol: symbol,
-                    ),
-                  ),
-                  const SizedBox(height: 28),
-                  Text(
-                    'Counted in budget',
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                  Text(
-                    countedTotal > counted.length
-                        ? 'Showing ${counted.length} of $countedTotal transactions'
-                        : '$countedTotal transactions',
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                  const SizedBox(height: 8),
-                  ListView.builder(
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    itemCount: counted.length,
-                    itemBuilder: (_, i) =>
-                        TransactionTile(transaction: counted[i], symbol: symbol),
-                  ),
-                ],
+      final counted = state.budgetRows;
+      final countedTotal = state.budgetRowCount;
+      if (total == 0)
+        return ListView(
+          children: const [
+            SizedBox(height: 100),
+            Padding(
+              padding: EdgeInsets.all(32),
+              child: Text(
+                'No spending in this budget period yet. Add a transaction '
+                'or import a statement to see charts here.',
+                textAlign: TextAlign.center,
               ),
+            ),
+          ],
+        );
+      return ListView(
+        padding: const EdgeInsets.fromLTRB(20, 12, 20, 100),
+        children: [
+          Text('By category', style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 16),
+          _CategoryDonut(byCategory: byCategory, total: total, symbol: symbol),
+          const SizedBox(height: 12),
+          ...byCategory.map(
+            (e) => _CategoryLegendRow(
+              category: e.$1,
+              amountMinor: e.$2,
+              symbol: symbol,
+            ),
+          ),
+          const SizedBox(height: 28),
+          Text('Daily spend', style: Theme.of(context).textTheme.titleLarge),
+          const SizedBox(height: 4),
+          Text(
+            '${period.start.day}/${period.start.month} - '
+            '${period.end.subtract(const Duration(days: 1)).day}/'
+            '${period.end.subtract(const Duration(days: 1)).month}',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            height: 220,
+            child: _DailyBarChart(
+              period: period,
+              byDay: byDay,
+              budgetMinor: budget,
+              symbol: symbol,
+            ),
+          ),
+          const SizedBox(height: 28),
+          Text(
+            'Counted in budget',
+            style: Theme.of(context).textTheme.titleLarge,
+          ),
+          Text(
+            countedTotal > counted.length
+                ? 'Showing ${counted.length} of $countedTotal transactions'
+                : '$countedTotal transactions',
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 8),
+          ListView.builder(
+            shrinkWrap: true,
+            physics: const NeverScrollableScrollPhysics(),
+            itemCount: counted.length,
+            itemBuilder: (_, i) =>
+                TransactionTile(transaction: counted[i], symbol: symbol),
+          ),
+        ],
       );
     },
   );

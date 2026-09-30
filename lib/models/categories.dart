@@ -10,12 +10,17 @@ const kCategories = <String>[
   'Bills',
   'Health',
   'Entertainment',
+  'Investments',
   'Transfers',
   'Income',
   'Other',
 ];
 
 const kUncategorized = 'Other';
+
+/// Money moved into savings (SIPs and the like) leaves the account but is
+/// not spending, so rows in this category stay out of the budget.
+const kInvestments = 'Investments';
 
 /// Icon shown for a category, in tiles, pickers and charts.
 const Map<String, IconData> kCategoryIcons = {
@@ -26,6 +31,7 @@ const Map<String, IconData> kCategoryIcons = {
   'Bills': Icons.receipt_long_rounded,
   'Health': Icons.favorite_rounded,
   'Entertainment': Icons.movie_rounded,
+  'Investments': Icons.trending_up_rounded,
   'Transfers': Icons.swap_horiz_rounded,
   'Income': Icons.savings_rounded,
   'Other': Icons.category_rounded,
@@ -44,6 +50,7 @@ const Map<String, Color> kCategoryColors = {
   'Bills': Color(0xFFC6A73F),
   'Health': Color(0xFFD9555C),
   'Entertainment': Color(0xFF8A6FD1),
+  'Investments': Color(0xFF3F8FA9),
   'Transfers': Color(0xFF4FADA8),
   'Income': Color(0xFF4FA97D),
   'Other': Color(0xFF8C8C8C),

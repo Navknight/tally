@@ -57,7 +57,12 @@ void main() {
   });
 
   test('totalBalance excludes card accounts entirely', () {
-    const bank = Account(id: 1, name: 'A', last4: '', openingBalanceMinor: 1000);
+    const bank = Account(
+      id: 1,
+      name: 'A',
+      last4: '',
+      openingBalanceMinor: 1000,
+    );
     const card = Account(
       id: 2,
       name: 'Card',
@@ -78,23 +83,45 @@ void main() {
     expect(last4Matches('3001', '4002'), isFalse);
     expect(last4Matches('', ''), isFalse);
     expect(last4Matches('', '3001'), isFalse);
+    expect(last4Matches('9500', '9644 9500'), isTrue);
+    expect(last4Matches('9644, 9500', '1006'), isFalse);
   });
 
   test('matchesForClaim requires last4 to match and bank not to conflict', () {
     expect(
-      matchesForClaim(rowLast4: '3001', rowBank: 'ICICI', last4: '3001', bank: 'ICICI'),
+      matchesForClaim(
+        rowLast4: '3001',
+        rowBank: 'ICICI',
+        last4: '3001',
+        bank: 'ICICI',
+      ),
       isTrue,
     );
     expect(
-      matchesForClaim(rowLast4: '3001', rowBank: null, last4: '3001', bank: 'ICICI'),
+      matchesForClaim(
+        rowLast4: '3001',
+        rowBank: null,
+        last4: '3001',
+        bank: 'ICICI',
+      ),
       isTrue,
     );
     expect(
-      matchesForClaim(rowLast4: '3001', rowBank: 'SBI', last4: '3001', bank: 'ICICI'),
+      matchesForClaim(
+        rowLast4: '3001',
+        rowBank: 'SBI',
+        last4: '3001',
+        bank: 'ICICI',
+      ),
       isFalse,
     );
     expect(
-      matchesForClaim(rowLast4: '4002', rowBank: 'ICICI', last4: '3001', bank: 'ICICI'),
+      matchesForClaim(
+        rowLast4: '4002',
+        rowBank: 'ICICI',
+        last4: '3001',
+        bank: 'ICICI',
+      ),
       isFalse,
     );
   });
@@ -111,8 +138,18 @@ void main() {
   });
 
   test('a transfer moves money out of the source and into the destination', () {
-    const source = Account(id: 1, name: 'Source', last4: '', openingBalanceMinor: 10000);
-    const dest = Account(id: 2, name: 'Dest', last4: '', openingBalanceMinor: 2000);
+    const source = Account(
+      id: 1,
+      name: 'Source',
+      last4: '',
+      openingBalanceMinor: 10000,
+    );
+    const dest = Account(
+      id: 2,
+      name: 'Dest',
+      last4: '',
+      openingBalanceMinor: 2000,
+    );
     final transfer = TallyTransaction(
       id: null,
       amountMinor: 3000,
@@ -146,17 +183,20 @@ void main() {
         inBudget: false,
       );
       final period = budgetPeriod(DateTime(2026, 9, 13), 1);
-      TallyTransaction expense(int amount, {int? accountId, bool excluded = false}) =>
-          TallyTransaction(
-            id: null,
-            amountMinor: amount,
-            kind: TransactionKind.expense,
-            occurredAt: DateTime(2026, 9, 5),
-            merchant: 'Test',
-            category: 'Other',
-            accountId: accountId,
-            excludeFromBudget: excluded,
-          );
+      TallyTransaction expense(
+        int amount, {
+        int? accountId,
+        bool excluded = false,
+      }) => TallyTransaction(
+        id: null,
+        amountMinor: amount,
+        kind: TransactionKind.expense,
+        occurredAt: DateTime(2026, 9, 5),
+        merchant: 'Test',
+        category: 'Other',
+        accountId: accountId,
+        excludeFromBudget: excluded,
+      );
       final transfer = TallyTransaction(
         id: null,
         amountMinor: 999,

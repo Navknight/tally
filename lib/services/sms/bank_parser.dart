@@ -82,7 +82,7 @@ abstract class BankParser {
     final kind = extractKind(body);
     final balance = extractBalance(body);
     final last4 = extractLast4(body);
-    final isCard = _cardRegex.hasMatch(body);
+    final isCard = _cardRegex.hasMatch(body) && !_debitCardRegex.hasMatch(body);
 
     if (amount == null || kind == null) {
       if (balance != null)
@@ -111,3 +111,11 @@ abstract class BankParser {
 /// Wording that names a card rather than a bank account: "Card XX3001",
 /// "Credit Card", "spent using ... Card".
 final _cardRegex = RegExp(r'\bcard\b|spent using', caseSensitive: false);
+
+/// A debit card spends from a bank account, so it is not a card account: the
+/// message names it as a debit card ("BLOCK DC 9500") or quotes the account
+/// balance where a credit card would quote its limit.
+final _debitCardRegex = RegExp(
+  r'debit(?:/atm)?\s+card|\bdc\b|av(?:ai)?l\.?\s*bal',
+  caseSensitive: false,
+);

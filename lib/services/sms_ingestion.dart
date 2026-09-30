@@ -100,6 +100,7 @@ TallyTransaction buildTransaction({
     body: message.body,
   ),
   accountId: accountId,
+  excludeFromBudget: category == kInvestments,
   reference: parsed.reference,
   balanceAfterMinor: parsed.balanceAfterMinor,
   categorySource: categorySource,
@@ -165,7 +166,10 @@ Future<IngestReport> ingestSms(Iterable<BankSms> messages) async {
     var report = const IngestReport();
     final rows = <TallyTransaction>[];
     final balanceUpdates = <(int, int, DateTime)>[];
-    final detections = <(String bank, String last4, AccountKind kind, int? bal, DateTime at)>[];
+    final detections =
+        <
+          (String bank, String last4, AccountKind kind, int? bal, DateTime at)
+        >[];
 
     for (var i = 0; i < parsed.length; i++) {
       final message = parsed[i].message;
@@ -173,7 +177,12 @@ Future<IngestReport> ingestSms(Iterable<BankSms> messages) async {
       switch (outcome) {
         case SmsIgnored():
           report = report.plus(ignored: 1);
-        case SmsBalance(:final balanceMinor, :final last4, :final bank, :final isCard):
+        case SmsBalance(
+          :final balanceMinor,
+          :final last4,
+          :final bank,
+          :final isCard,
+        ):
           final account = _match(accounts, last4);
           if (account?.id == null) {
             if (last4 != null && last4.isNotEmpty)
@@ -282,8 +291,7 @@ Future<IngestReport> ingestNewSms() async {
   final messages = await AndroidBridge.smsSince(since);
   final report = await ingestSms(messages);
   final watermark = nextWatermark(since, messages);
-  if (watermark != since)
-    await db.setSetting('sms_last_seen', '$watermark');
+  if (watermark != since) await db.setSetting('sms_last_seen', '$watermark');
   return report;
 }
 
@@ -324,13 +332,19 @@ Future<IngestReport> rereadStoredSms() async {
 
   var reparsed = 0;
   var failed = 0;
+  final stale = <int>[];
   for (final row in withBody) {
     try {
       final outcome = parseBankSms(
         sender: row.smsSender ?? '',
         body: row.smsBody!,
       );
-      if (outcome is! SmsTransaction) continue;
+      // The parser no longer reads this message as money moving (a declined
+      // card, a non-bank sender), so the row was never a transaction.
+      if (outcome is! SmsTransaction) {
+        stale.add(row.id!);
+        continue;
+      }
       // A manually confirmed category was set while looking at this
       // merchant text, so leave it (and the label) exactly as the user saw
       // it; the account link is likewise never touched by a re-read.
@@ -349,6 +363,7 @@ Future<IngestReport> rereadStoredSms() async {
     }
   }
 
+  if (stale.isNotEmpty) await db.deleteByIds(stale);
   var report = IngestReport(inserted: reparsed, failed: failed);
   if (withoutBody.isNotEmpty) {
     await db.deleteByIds(withoutBody.map((r) => r.id!).toList());
@@ -421,6 +436,11 @@ Future<int> ingestStatementRows({
 /// unlabelled row from the same merchant so the question is asked once.
 Future<int> confirmCategory(TallyTransaction row, String category) async {
   final db = TallyDatabase.instance;
+  final key = Categorizer.merchantKey(row.merchant);
+  final mixed = Categorizer.contradicts(
+    await db.merchantCategory(key),
+    category,
+  );
   await Categorizer(db)
       .learn(merchant: row.merchant, body: row.note, category: category);
   await db.updateTransaction(
@@ -428,10 +448,11 @@ Future<int> confirmCategory(TallyTransaction row, String category) async {
       category: category,
       categorySource: CategorySource.manual,
       needsReview: false,
+      excludeFromBudget: category == kInvestments || row.excludeFromBudget,
     ),
   );
-  return db.applyCategoryToMerchant(
-    Categorizer.merchantKey(row.merchant),
-    category,
-  );
+  // A merchant the user has now labelled two different ways is genuinely
+  // mixed; relabelling its other rows would undo the earlier answer.
+  if (mixed) return 0;
+  return db.applyCategoryToMerchant(key, category);
 }

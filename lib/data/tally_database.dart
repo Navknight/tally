@@ -170,9 +170,6 @@ class TallyDatabase implements CategoryStore {
       .query('accounts', orderBy: 'id')
       .then((rows) => rows.map(Account.fromMap).toList());
 
-  Future<int> addAccount(Account account) async =>
-      (await _db).insert('accounts', account.toMap()..remove('id'));
-
   /// Adds [account] and, in the same transaction, reassigns every orphan
   /// transaction that matches its last4 (and [bank], when known) to it.
   /// Callers still run [linkSelfTransfers] afterward since that reads back
@@ -228,19 +225,6 @@ class TallyDatabase implements CategoryStore {
     await db.delete('accounts', where: 'id = ?', whereArgs: [id]);
   }
 
-  /// Matches a bank-supplied last-4 to a tracked account. Returns null when no
-  /// account claims those digits, so ingestion can still store the row.
-  Future<Account?> accountForLast4(String? last4) async {
-    if (last4 == null || last4.isEmpty) return null;
-    final rows = await (await _db).query(
-      'accounts',
-      where: 'last4 = ?',
-      whereArgs: [last4],
-      limit: 1,
-    );
-    return rows.isEmpty ? null : Account.fromMap(rows.single);
-  }
-
   /// Stores the running balance a bank stated, for reconciliation against the
   /// ledger's own arithmetic.
   Future<void> recordReportedBalance(
@@ -289,14 +273,6 @@ class TallyDatabase implements CategoryStore {
   }
 
   /// Sum of [accountBalancesSql] over bank accounts only; cards never count.
-  Future<int> totalBalanceSql() async {
-    final balances = await accountBalancesSql();
-    final bankIds = (await accounts())
-        .where((a) => a.kind == AccountKind.bank)
-        .map((a) => a.id);
-    return bankIds.fold<int>(0, (sum, id) => sum + (balances[id] ?? 0));
-  }
-
   /// Same filters as the pure [budgetSpent], computed with one SUM instead of
   /// loading every transaction.
   Future<int> spentInPeriodSql(BudgetPeriod period) async {
@@ -333,16 +309,41 @@ class TallyDatabase implements CategoryStore {
     required AccountKind kind,
     int? balanceMinor,
     required DateTime at,
-  }) async => (await _db).rawInsert(
-    '''INSERT INTO detected_accounts (bank, last4, kind, message_count, last_balance_minor, last_seen, dismissed)
+  }) async {
+    final db = await _db;
+    // "XXX238" and "XX6238" are one account quoted with fewer digits; fold
+    // them into a single detection keyed by the longer number.
+    for (final row in await db.query(
+      'detected_accounts',
+      columns: ['last4'],
+      where: 'bank = ? AND last4 != ?',
+      whereArgs: [bank, last4],
+    )) {
+      final known = row['last4'] as String;
+      if (!last4Matches(known, last4)) continue;
+      if (known.length >= last4.length) {
+        last4 = known;
+      } else {
+        await db.update(
+          'detected_accounts',
+          {'last4': last4},
+          where: 'bank = ? AND last4 = ?',
+          whereArgs: [bank, known],
+        );
+      }
+      break;
+    }
+    await db.rawInsert(
+      '''INSERT INTO detected_accounts (bank, last4, kind, message_count, last_balance_minor, last_seen, dismissed)
        VALUES (?, ?, ?, 1, ?, ?, 0)
        ON CONFLICT(bank, last4) DO UPDATE SET
          message_count = message_count + 1,
          kind = excluded.kind,
          last_balance_minor = COALESCE(excluded.last_balance_minor, last_balance_minor),
          last_seen = MAX(last_seen, excluded.last_seen)''',
-    [bank, last4, kind.name, balanceMinor, at.millisecondsSinceEpoch],
-  );
+      [bank, last4, kind.name, balanceMinor, at.millisecondsSinceEpoch],
+    );
+  }
 
   Future<void> dismissDetection(String bank, String last4) async =>
       (await _db).update(
@@ -416,7 +417,7 @@ class TallyDatabase implements CategoryStore {
   /// Inserts unless an identical fingerprint is already stored. Returns whether
   /// a row was actually written.
   Future<bool> add(TallyTransaction transaction) async =>
-      !await _hasReference(transaction) &&
+      !await _hasReference(await _db, transaction) &&
       await (await _db).insert(
             'transactions',
             transaction.toMap()..remove('id'),
@@ -429,9 +430,9 @@ class TallyDatabase implements CategoryStore {
   /// same account is the same money. Scoped to the account so the two legs of
   /// a self transfer (same reference, same amount, different accounts) both
   /// land in the ledger for [linkSelfTransfers] to pair up.
-  Future<bool> _hasReference(TallyTransaction t) async =>
+  Future<bool> _hasReference(DatabaseExecutor db, TallyTransaction t) async =>
       (t.reference ?? '').isNotEmpty &&
-      (await (await _db).query(
+      (await db.query(
         'transactions',
         columns: ['id'],
         where: t.accountId == null
@@ -456,20 +457,7 @@ class TallyDatabase implements CategoryStore {
     var inserted = 0;
     await db.transaction((txn) async {
       for (final row in rows) {
-        if ((row.reference ?? '').isNotEmpty) {
-          final existing = await txn.query(
-            'transactions',
-            columns: ['id'],
-            where: row.accountId == null
-                ? 'reference = ? AND amount_minor = ? AND account_id IS NULL'
-                : 'reference = ? AND amount_minor = ? AND account_id = ?',
-            whereArgs: row.accountId == null
-                ? [row.reference, row.amountMinor]
-                : [row.reference, row.amountMinor, row.accountId],
-            limit: 1,
-          );
-          if (existing.isNotEmpty) continue;
-        }
+        if (await _hasReference(txn, row)) continue;
         final id = await txn.insert(
           'transactions',
           row.toMap()..remove('id'),
@@ -550,21 +538,9 @@ class TallyDatabase implements CategoryStore {
     return matches.length;
   }
 
-  /// Total spend in [period] on accounts that count toward the budget,
-  /// excluding flagged rows, transfers, and rows with no account. The
-  /// filtering itself is [budgetSpent], a pure function tested without sqflite.
-  Future<List<TallyTransaction>> budgetRows(BudgetPeriod period) async =>
-      budgetTransactions(
-        await transactions(limit: -1),
-        await accounts(),
-        period,
-      ).toList();
-
-  Future<int> spentInPeriod(BudgetPeriod period) async =>
-      budgetSpent(await transactions(limit: -1), await accounts(), period);
-
-  /// Same rows as [budgetRows], capped at [limit] for a list that never
-  /// walks the whole table; the second value is the true total count.
+  /// Budget-counted rows in [period], capped at [limit] so the list never
+  /// walks the whole table; the second value is the true total count. The
+  /// same filters as the pure [budgetSpent], tested without sqflite.
   Future<(List<TallyTransaction>, int)> budgetRowsPage(
     BudgetPeriod period, {
     int limit = 200,
@@ -597,9 +573,6 @@ class TallyDatabase implements CategoryStore {
   /// Removes every SMS-sourced transaction so the inbox can be re-read after
   /// a parser fix, without touching manual or statement entries or learned
   /// merchant rules.
-  Future<void> deleteSmsRows() async =>
-      (await _db).delete('transactions', where: "source = 'sms'");
-
   Future<void> updateTransaction(TallyTransaction transaction) async =>
       (await _db).update(
         'transactions',
@@ -636,6 +609,7 @@ class TallyDatabase implements CategoryStore {
         'category': category,
         'category_source': CategorySource.learned.name,
         'needs_review': 0,
+        if (category == kInvestments) 'exclude_from_budget': 1,
       },
       where: 'id IN (${List.filled(ids.length, '?').join(',')})',
       whereArgs: ids,
@@ -665,6 +639,14 @@ class TallyDatabase implements CategoryStore {
            hits = hits + 1''',
     [merchantKey, category],
   );
+
+  @override
+  Future<void> forgetMerchantCategory(String merchantKey) async =>
+      (await _db).delete(
+        'merchant_rules',
+        where: 'merchant_key = ?',
+        whereArgs: [merchantKey],
+      );
 
   @override
   Future<Map<String, int>> tokenCounts(String token) async => (await _db)
@@ -743,12 +725,6 @@ class TallyDatabase implements CategoryStore {
                 )
                 .toList(),
           );
-
-  Future<void> forgetRule(String merchantKey) async => (await _db).delete(
-    'merchant_rules',
-    where: 'merchant_key = ?',
-    whereArgs: [merchantKey],
-  );
 
   /// Categories with budget-counted spend inside [period], largest first.
   /// Computed in SQL so the UI never walks the whole table.

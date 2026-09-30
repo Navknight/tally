@@ -33,9 +33,10 @@ void main() {
 
   test('fingerprint excludes the timestamp', () {
     String fp(DateTime at) => buildTransaction(
-      parsed:
-          parseBankSms(sender: 'AD-HDFCBK', body: 'Rs.500 debited at ACME')
-              as SmsTransaction,
+      parsed: parseBankSms(
+        sender: 'AD-HDFCBK',
+        body: 'Rs.500 debited at ACME',
+      ) as SmsTransaction,
       message: BankSms(
         sender: 'AD-HDFCBK',
         timestamp: at,
@@ -47,7 +48,8 @@ void main() {
   });
 
   group('nextWatermark', () {
-    BankSms at(DateTime t) => BankSms(sender: 'AD-HDFCBK', timestamp: t, body: 'x');
+    BankSms at(DateTime t) =>
+        BankSms(sender: 'AD-HDFCBK', timestamp: t, body: 'x');
 
     test('advances to the latest message timestamp', () {
       final watermark = nextWatermark(0, [

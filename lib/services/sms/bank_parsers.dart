@@ -1,6 +1,7 @@
 import '../../core/money.dart';
 import '../../models/transaction.dart';
 import 'bank_parser.dart';
+import 'message_filter.dart';
 
 /// Parses one Indian bank/UPI SMS, picking a bank-specific parser by sender
 /// id (DLT-style, e.g. `AD-HDFCBK-S`) and falling back to a generic parser
@@ -8,16 +9,28 @@ import 'bank_parser.dart';
 SmsOutcome parseBankSms({required String sender, required String body}) {
   final parser = _registry.firstWhere(
     (p) => p.canHandle(sender),
-    orElse: () => GenericIndianBankParser(),
+    orElse: () => _fallback,
   );
-  return parser.parse(body, sender);
+  final outcome = parser.parse(body, sender);
+  // From an unknown sender, only a message naming an account or card is a
+  // bank alert. Merchants, insurers and brokers text "payment of Rs. X
+  // received" too, and with no digits those rows would land on whichever
+  // account happened to be the only one.
+  if (identical(parser, _fallback) &&
+      outcome is SmsTransaction &&
+      outcome.last4 == null)
+    return SmsIgnored(MessageClass.personal);
+  return outcome;
 }
+
+final _fallback = GenericIndianBankParser();
 
 // Subclass BankParser only when a bank's wording needs its own extraction.
 final _registry = <BankParser>[
   GenericIndianBankParser('HDFC', 'HDFC'),
   GenericIndianBankParser('ICICI', 'ICICI'),
   GenericIndianBankParser('SBI', 'SBI'),
+  GenericIndianBankParser('SBI', 'SBYONO'),
   GenericIndianBankParser('Axis', 'AXIS'),
   GenericIndianBankParser('Kotak', 'KOTAK'),
   GenericIndianBankParser('Canara', 'CANBNK'),
@@ -120,7 +133,9 @@ const _creditWords = [
   'cr',
 ];
 
-final _debitWordRegexes = [for (final w in _debitWords) RegExp(r'\b' + w + r'\b')];
+final _debitWordRegexes = [
+  for (final w in _debitWords) RegExp(r'\b' + w + r'\b'),
+];
 final _creditWordRegexes = [
   for (final w in _creditWords) RegExp(r'\b' + w + r'\b'),
 ];
@@ -243,14 +258,23 @@ class GenericIndianBankParser extends BankParser {
       return _cleanMerchant(candidate, bank);
     }
 
-    // 7. Fallback.
+    // 7. "debit by NACH" names no payee; a shared label lets one correction
+    // (say, SIPs as Investments) apply to every such debit.
+    if (_nachRegex.hasMatch(body)) return 'NACH debit';
+
+    // 8. Fallback.
     return '$bank transaction';
   }
 }
 
 final _allDigitsRegex = RegExp(r'^\d+$');
 
-final _accountLineRegex = RegExp(r'^your\s+a(/c|ccount)\b', caseSensitive: false);
+final _nachRegex = RegExp(r'\bnach\b', caseSensitive: false);
+
+final _accountLineRegex = RegExp(
+  r'^your\s+a(/c|ccount)\b',
+  caseSensitive: false,
+);
 
 bool _looksLikeAccountLine(String candidate) =>
     _accountLineRegex.hasMatch(candidate);

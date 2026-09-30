@@ -67,8 +67,11 @@ class MainActivity : FlutterActivity() {
         return messages
     }
 
-    override fun onResume() {
-        super.onResume()
+    /// Watches the inbox for as long as the process is alive, not just while
+    /// the app is in front: a message that arrives with Tally in the
+    /// background is then already in the ledger when it comes forward.
+    private fun watchSms() {
+        if (smsObserver != null) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_SMS) != PackageManager.PERMISSION_GRANTED) return
         val observer = object : ContentObserver(debounceHandler) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
@@ -80,14 +83,19 @@ class MainActivity : FlutterActivity() {
         contentResolver.registerContentObserver(Telephony.Sms.CONTENT_URI, true, observer)
     }
 
-    override fun onPause() {
+    override fun onStart() {
+        super.onStart()
+        watchSms()
+    }
+
+    override fun onDestroy() {
         smsObserver?.let { contentResolver.unregisterContentObserver(it) }
         smsObserver = null
         debounceHandler.removeCallbacks(notifySmsChanged)
-        super.onPause()
+        super.onDestroy()
     }
 
-    override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grants: IntArray) { super.onRequestPermissionsResult(code, permissions, grants); if (code == 41) { smsResult?.success(grants.isNotEmpty() && grants[0] == PackageManager.PERMISSION_GRANTED); smsResult = null } }
+    override fun onRequestPermissionsResult(code: Int, permissions: Array<out String>, grants: IntArray) { super.onRequestPermissionsResult(code, permissions, grants); if (code == 41) { smsResult?.success(grants.isNotEmpty() && grants[0] == PackageManager.PERMISSION_GRANTED); smsResult = null; watchSms() } }
     override fun onActivityResult(code: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(code, resultCode, data)
         if (code == 42) {

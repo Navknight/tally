@@ -50,3 +50,6 @@ android/app/upload-keystore.jks
 
 # Widget Preview related
 .widget_preview/
+
+# Golden test diffs
+test/failures/

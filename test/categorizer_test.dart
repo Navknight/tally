@@ -17,6 +17,11 @@ class InMemoryCategoryStore implements CategoryStore {
   }
 
   @override
+  Future<void> forgetMerchantCategory(String merchantKey) async {
+    merchantRules.remove(merchantKey);
+  }
+
+  @override
   Future<Map<String, int>> tokenCounts(String token) async =>
       Map.of(_tokenCounts[token] ?? {});
 
@@ -42,6 +47,41 @@ class InMemoryCategoryStore implements CategoryStore {
 }
 
 void main() {
+  group('mixed merchants', () {
+    test('a second, different correction drops the merchant rule', () async {
+      final store = InMemoryCategoryStore();
+      final categorizer = Categorizer(store);
+      await categorizer.learn(merchant: 'DMart', category: 'Groceries');
+      expect(
+        store.merchantRules[Categorizer.merchantKey('DMart')],
+        'Groceries',
+      );
+
+      await categorizer.learn(merchant: 'DMart', category: 'Shopping');
+      expect(store.merchantRules, isEmpty);
+
+      // With no rule left, the merchant is guessed again rather than forced,
+      // so a mixed supermarket comes back for review instead of being wrong.
+      final guess = await categorizer.guess(merchant: 'DMart');
+      expect(guess.confidence, lessThan(1.0));
+    });
+
+    test('repeating the same correction keeps the rule', () async {
+      final store = InMemoryCategoryStore();
+      final categorizer = Categorizer(store);
+      await categorizer.learn(merchant: 'DMart', category: 'Groceries');
+      await categorizer.learn(merchant: 'DMart', category: 'Groceries');
+      expect(
+        store.merchantRules[Categorizer.merchantKey('DMart')],
+        'Groceries',
+      );
+      expect(
+        (await categorizer.guess(merchant: 'DMart')).category,
+        'Groceries',
+      );
+    });
+  });
+
   group('merchantKey', () {
     test('normalises case, digits and punctuation', () {
       expect(
