@@ -1,10 +1,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Optional. Tally only reads financial notifications/SMS after consent. -->
+    <!-- Read-only, and only ever used to parse bank and UPI transaction
+         messages on the device. Nothing is sent anywhere, and the app has no
+         internet permission at all. -->
     <uses-permission android:name="android.permission.READ_SMS" />
     <application
         android:label="Tally"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:enableOnBackInvokedCallback="true"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false">
         <activity
             android:name=".MainActivity"
             android:exported="true"

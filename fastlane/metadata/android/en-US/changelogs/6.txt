@@ -1,0 +1,5 @@
+Redesigned throughout: a period card with a pace marker, the last seven days as a strip, accounts as cards, and Activity grouped by day with pinned headings.
+
+Much faster. Every screen now reads one in-memory store instead of re-querying the database, so switching tabs is instant.
+
+Jump to any day in Activity. Budget moved into a sheet you open from Home. Investments and SIP debits stay out of the budget.

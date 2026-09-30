@@ -390,18 +390,41 @@ class TallyDatabase implements CategoryStore {
 
   // ------------------------------------------------------------ transactions
 
+  /// The ledger, newest first. [before] windows it to rows older than that
+  /// instant, which is how Activity jumps back to a chosen day without paging
+  /// through everything in between.
   Future<List<TallyTransaction>> transactions({
     int limit = 500,
     int? accountId,
-  }) async => (await _db)
-      .query(
-        'transactions',
-        where: accountId == null ? null : 'account_id = ?',
-        whereArgs: accountId == null ? null : [accountId],
-        orderBy: 'occurred_at DESC',
-        limit: limit,
-      )
-      .then((rows) => rows.map(TallyTransaction.fromMap).toList());
+    DateTime? before,
+  }) async {
+    final clauses = [
+      if (accountId != null) 'account_id = ?',
+      if (before != null) 'occurred_at < ?',
+    ];
+    return (await _db)
+        .query(
+          'transactions',
+          where: clauses.isEmpty ? null : clauses.join(' AND '),
+          whereArgs: [
+            ?accountId,
+            if (before != null) before.millisecondsSinceEpoch,
+          ],
+          orderBy: 'occurred_at DESC',
+          limit: limit,
+        )
+        .then((rows) => rows.map(TallyTransaction.fromMap).toList());
+  }
+
+  /// When the ledger starts, for the date picker's lower bound. Null when
+  /// there are no transactions yet.
+  Future<DateTime?> oldestTransaction() async {
+    final rows = await (await _db).rawQuery(
+      'SELECT MIN(occurred_at) AS at FROM transactions',
+    );
+    final at = rows.first['at'] as int?;
+    return at == null ? null : DateTime.fromMillisecondsSinceEpoch(at);
+  }
 
   /// Rows whose category was a low-confidence guess, newest first.
   Future<List<TallyTransaction>> reviewQueue({int limit = 50}) async =>

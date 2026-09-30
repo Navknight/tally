@@ -9,7 +9,14 @@ import 'package:flutter/material.dart';
 abstract final class Corners {
   static const double card = 16;
   static const double control = 14;
-  static const double sheet = 24;
+  static const double sheet = 26;
+
+  /// The period card and anything else that carries a headline figure.
+  static const double hero = 20;
+
+  /// Category avatars and other small square tiles: a squircle, not a circle,
+  /// so they belong to the same family as the cards.
+  static const double tile = 12;
 }
 
 /// Money figures: tabular so columns of amounts align digit for digit.
@@ -53,18 +60,21 @@ class LipBorder extends OutlinedBorder {
   void paint(Canvas canvas, Rect rect, {TextDirection? textDirection}) {
     final outer = _rrect(rect);
     if (depth > 0 && lip.a > 0) {
-      final face = RRect.fromRectAndRadius(
-        Rect.fromLTRB(outer.left, outer.top, outer.right, outer.bottom - depth),
-        Radius.circular(radius),
-      );
-      canvas.drawPath(
-        Path.combine(
-          PathOperation.difference,
-          Path()..addRRect(outer),
-          Path()..addRRect(face),
+      // The lip is the strip of the outer shape below where the face ends.
+      // Clipping to that band and refilling the rounded rect gets there
+      // without a path boolean, which every card in a list would otherwise
+      // pay for: Path.combine allocates and intersects two paths per paint.
+      canvas.save();
+      canvas.clipRect(
+        Rect.fromLTRB(
+          outer.left,
+          outer.bottom - depth,
+          outer.right,
+          outer.bottom,
         ),
-        Paint()..color = lip,
       );
+      canvas.drawRRect(outer, Paint()..color = lip);
+      canvas.restore();
     }
     if (side.style != BorderStyle.none && side.width > 0) {
       canvas.drawRRect(outer.deflate(side.width / 2), side.toPaint());
@@ -143,6 +153,14 @@ abstract final class TallyTheme {
   /// a screen full of money figures needs.
   static const accent = Color(0xFF0D9488);
 
+  /// Paper, not glare. A card is pure white on it, which is what makes the
+  /// raised edge and the lip underneath visible at all - when the two were
+  /// both white every card on Home dissolved into the background.
+  static const _paper = Color(0xFFFAF9F7);
+  static const _paperCard = Color(0xFFFFFFFF);
+  static const _ink = Color(0xFF0B0B0C);
+  static const _inkCard = Color(0xFF17171A);
+
   static ThemeData build(Brightness brightness) {
     final light = brightness == Brightness.light;
     final scheme =
@@ -153,16 +171,16 @@ abstract final class TallyTheme {
         ).copyWith(
           primary: accent,
           onPrimary: Colors.white,
-          surface: light ? Colors.white : Colors.black,
-          onSurface: light ? Colors.black : Colors.white,
-          onSurfaceVariant: Color(light ? 0xFF6B6B6B : 0xFFA8A8A8),
-          surfaceContainerLowest: light ? Colors.white : Colors.black,
-          surfaceContainerLow: Color(light ? 0xFFF7F7F7 : 0xFF141414),
-          surfaceContainer: Color(light ? 0xFFF2F2F2 : 0xFF1B1B1B),
-          surfaceContainerHigh: Color(light ? 0xFFEBEBEB : 0xFF232323),
-          surfaceContainerHighest: Color(light ? 0xFFE3E3E3 : 0xFF2C2C2C),
-          outline: Color(light ? 0xFF9E9E9E : 0xFF6E6E6E),
-          outlineVariant: Color(light ? 0xFFE6E6E6 : 0xFF262626),
+          surface: light ? _paper : _ink,
+          onSurface: Color(light ? 0xFF121212 : 0xFFF4F4F2),
+          onSurfaceVariant: Color(light ? 0xFF74716B : 0xFF9B9A96),
+          surfaceContainerLowest: light ? _paperCard : _inkCard,
+          surfaceContainerLow: Color(light ? 0xFFF4F2EE : 0xFF1C1C20),
+          surfaceContainer: Color(light ? 0xFFEFEDE8 : 0xFF212127),
+          surfaceContainerHigh: Color(light ? 0xFFE7E4DE : 0xFF29292F),
+          surfaceContainerHighest: Color(light ? 0xFFDEDAD3 : 0xFF33333A),
+          outline: Color(light ? 0xFF9C9891 : 0xFF6E6D72),
+          outlineVariant: Color(light ? 0xFFE3DFD8 : 0xFF2C2C32),
           surfaceTint: Colors.transparent,
         );
     final control = RoundedRectangleBorder(
@@ -204,31 +222,58 @@ abstract final class TallyTheme {
     return base.copyWith(
       scaffoldBackgroundColor: scheme.surface,
       textTheme: text.copyWith(
+        // The headline figure. Nunito's w900 needs the tracking pulled in
+        // hard at this size or the digits drift apart.
         displayMedium: text.displayMedium?.copyWith(
+          fontSize: 50,
           fontWeight: FontWeight.w900,
-          letterSpacing: -2,
-          height: 1.05,
+          letterSpacing: -2.4,
+          height: 1.0,
           fontFeatures: tabular,
         ),
+        displaySmall: text.displaySmall?.copyWith(
+          fontSize: 34,
+          fontWeight: FontWeight.w900,
+          letterSpacing: -1.2,
+          height: 1.05,
+        ),
         headlineSmall: text.headlineSmall?.copyWith(
+          fontSize: 23,
           fontWeight: FontWeight.w800,
-          letterSpacing: -0.4,
+          letterSpacing: -0.5,
         ),
         titleLarge: text.titleLarge?.copyWith(
-          fontSize: 19,
+          fontSize: 18,
           fontWeight: FontWeight.w800,
           letterSpacing: -0.3,
         ),
-        titleMedium: text.titleMedium?.copyWith(fontWeight: FontWeight.w700),
+        titleMedium: text.titleMedium?.copyWith(
+          fontSize: 15.5,
+          fontWeight: FontWeight.w700,
+          letterSpacing: -0.15,
+        ),
+        titleSmall: text.titleSmall?.copyWith(
+          fontSize: 13,
+          fontWeight: FontWeight.w800,
+          letterSpacing: 0.6,
+        ),
         labelLarge: text.labelLarge?.copyWith(
           fontWeight: FontWeight.w800,
           fontSize: 15,
         ),
+        labelSmall: text.labelSmall?.copyWith(
+          fontWeight: FontWeight.w800,
+          fontSize: 11,
+          letterSpacing: 0.2,
+        ),
         bodyLarge: text.bodyLarge?.copyWith(fontWeight: FontWeight.w600),
-        bodyMedium: text.bodyMedium?.copyWith(fontWeight: FontWeight.w600),
+        bodyMedium: text.bodyMedium?.copyWith(
+          fontSize: 14,
+          fontWeight: FontWeight.w600,
+        ),
         bodySmall: text.bodySmall
             ?.merge(muted)
-            .copyWith(fontWeight: FontWeight.w600),
+            .copyWith(fontSize: 12.5, fontWeight: FontWeight.w600),
       ),
       appBarTheme: AppBarTheme(
         centerTitle: false,
@@ -239,11 +284,12 @@ abstract final class TallyTheme {
         surfaceTintColor: Colors.transparent,
         titleTextStyle: text.headlineSmall?.copyWith(
           fontFamily: 'Nunito',
-          fontSize: 25,
+          fontSize: 26,
           color: scheme.onSurface,
           fontWeight: FontWeight.w900,
-          letterSpacing: -0.5,
+          letterSpacing: -0.7,
         ),
+        titleSpacing: 20,
       ),
       cardTheme: CardThemeData(
         elevation: 0,
@@ -288,7 +334,8 @@ abstract final class TallyTheme {
       segmentedButtonTheme: SegmentedButtonThemeData(
         style: SegmentedButton.styleFrom(
           shape: control,
-          side: BorderSide(color: scheme.outlineVariant),
+          side: BorderSide(color: scheme.outlineVariant, width: 1.5),
+          foregroundColor: scheme.onSurfaceVariant,
           selectedBackgroundColor: scheme.primary,
           selectedForegroundColor: scheme.onPrimary,
         ),
@@ -306,12 +353,32 @@ abstract final class TallyTheme {
         ),
       ),
       navigationBarTheme: NavigationBarThemeData(
-        height: 64,
+        height: 66,
         elevation: 0,
         backgroundColor: scheme.surface,
         surfaceTintColor: Colors.transparent,
-        indicatorColor: scheme.primary.withValues(alpha: 0.16),
-        labelBehavior: NavigationDestinationLabelBehavior.onlyShowSelected,
+        indicatorColor: scheme.primary.withValues(alpha: 0.15),
+        indicatorShape: const StadiumBorder(),
+        labelBehavior: NavigationDestinationLabelBehavior.alwaysShow,
+        iconTheme: WidgetStateProperty.resolveWith(
+          (states) => IconThemeData(
+            size: 23,
+            color: states.contains(WidgetState.selected)
+                ? scheme.primary
+                : scheme.onSurfaceVariant,
+          ),
+        ),
+        labelTextStyle: WidgetStateProperty.resolveWith(
+          (states) => TextStyle(
+            fontFamily: 'Nunito',
+            fontSize: 11.5,
+            fontWeight: FontWeight.w800,
+            letterSpacing: -0.1,
+            color: states.contains(WidgetState.selected)
+                ? scheme.onSurface
+                : scheme.onSurfaceVariant,
+          ),
+        ),
       ),
       floatingActionButtonTheme: FloatingActionButtonThemeData(
         elevation: 0,
@@ -328,7 +395,9 @@ abstract final class TallyTheme {
         ),
       ),
       bottomSheetTheme: BottomSheetThemeData(
-        backgroundColor: scheme.surfaceContainerLow,
+        backgroundColor: scheme.surfaceContainerLowest,
+        showDragHandle: true,
+        dragHandleColor: scheme.outlineVariant,
         surfaceTintColor: Colors.transparent,
         shape: const RoundedRectangleBorder(
           borderRadius: BorderRadius.vertical(
@@ -339,6 +408,23 @@ abstract final class TallyTheme {
       snackBarTheme: SnackBarThemeData(
         behavior: SnackBarBehavior.floating,
         shape: control,
+        backgroundColor: scheme.inverseSurface,
+        contentTextStyle: TextStyle(
+          fontFamily: 'Nunito',
+          fontWeight: FontWeight.w700,
+          color: scheme.onInverseSurface,
+        ),
+      ),
+      chipTheme: ChipThemeData(
+        side: BorderSide(color: scheme.outlineVariant, width: 1.5),
+        shape: const StadiumBorder(),
+        backgroundColor: scheme.surfaceContainerLowest,
+        labelStyle: TextStyle(
+          fontFamily: 'Nunito',
+          fontSize: 13,
+          fontWeight: FontWeight.w700,
+          color: scheme.onSurface,
+        ),
       ),
       switchTheme: SwitchThemeData(
         trackOutlineColor: WidgetStateProperty.all(Colors.transparent),

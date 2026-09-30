@@ -47,13 +47,41 @@ jobs:
 
       - run: flutter pub get
 
+      - run: flutter analyze
+      - run: flutter test
+
       - run: flutter build apk --release --split-per-abi
       - run: flutter build apk --release
+
+      # Google Play takes an app bundle, not an APK. It is kept off the
+      # release page - IzzyOnDroid reads the APKs from there - and left as a
+      # run artifact to upload to the Play Console by hand.
+      - run: flutter build appbundle --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: play-bundle
+          path: build/app/outputs/bundle/release/*.aab
+          retention-days: 30
+
+      - name: Release notes from the store changelog
+        id: notes
+        run: |
+          code=$(grep -oP '^version:.*\+\K[0-9]+' pubspec.yaml)
+          file="fastlane/metadata/android/en-US/changelogs/$code.txt"
+          if [ -f "$file" ]; then
+            {
+              echo 'body<<TALLY_EOF'
+              cat "$file"
+              echo TALLY_EOF
+            } >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body: ${{ steps.notes.outputs.body }}
           files: build/app/outputs/flutter-apk/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

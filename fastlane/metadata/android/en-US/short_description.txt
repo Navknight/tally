@@ -1,0 +1,1 @@
+Private budget tracker that reads your bank SMS. No account, no internet.

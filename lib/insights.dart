@@ -2,13 +2,15 @@ import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 
 import 'app/theme.dart';
+import 'app/ui.dart';
 import 'core/budget_period.dart';
 import 'core/money.dart';
 import 'main.dart' show TallyPage, TransactionTile;
 import 'models/categories.dart';
 
-/// Spending charts for the current budget period: category breakdown and a
-/// daily bar chart, with the budget's daily pace overlaid when one is set.
+/// Where the period's money went: a ring with the total in the middle, the
+/// categories under it as share bars, the same period day by day, and finally
+/// the rows the budget actually counted.
 class InsightsScreen extends StatelessWidget {
   const InsightsScreen({super.key});
 
@@ -16,79 +18,131 @@ class InsightsScreen extends StatelessWidget {
   Widget build(BuildContext context) => TallyPage(
     title: 'Insights',
     builder: (context, state) {
-      final period = state.period;
       final byCategory = state.byCategory;
-      final byDay = state.byDay;
-      final symbol = state.symbol;
-      final budget = state.budgetMinor;
       final total = byCategory.fold<int>(0, (sum, e) => sum + e.$2);
-      final counted = state.budgetRows;
-      final countedTotal = state.budgetRowCount;
       if (total == 0)
-        return ListView(
-          children: const [
-            SizedBox(height: 100),
-            Padding(
-              padding: EdgeInsets.all(32),
-              child: Text(
-                'No spending in this budget period yet. Add a transaction '
-                'or import a statement to see charts here.',
-                textAlign: TextAlign.center,
-              ),
-            ),
-          ],
+        return const EmptyState(
+          icon: Icons.donut_small_outlined,
+          title: 'Nothing to chart yet',
+          message:
+              'Once this budget period has some spending in it, the '
+              'breakdown shows up here.',
         );
-      return ListView(
-        padding: const EdgeInsets.fromLTRB(20, 12, 20, 100),
-        children: [
-          Text('By category', style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 16),
-          _CategoryDonut(byCategory: byCategory, total: total, symbol: symbol),
-          const SizedBox(height: 12),
-          ...byCategory.map(
-            (e) => _CategoryLegendRow(
-              category: e.$1,
-              amountMinor: e.$2,
-              symbol: symbol,
+      final period = state.period;
+      final symbol = state.symbol;
+      final elapsed = DateTime.now().difference(period.start).inDays + 1;
+      final counted = state.budgetRows;
+      // A CustomScrollView, not a ListView: the counted rows can run to two
+      // hundred, and a plain ListView would build every one of them before it
+      // could paint the chart above.
+      return CustomScrollView(
+        slivers: [
+          SliverPadding(
+            padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
+            sliver: SliverList.list(
+              children: [
+                RepaintBoundary(
+                  child: _Panel(
+                    child: Column(
+                      children: [
+                        SizedBox(
+                          height: 210,
+                          child: _CategoryDonut(
+                            byCategory: byCategory,
+                            total: total,
+                            symbol: symbol,
+                          ),
+                        ),
+                        const SizedBox(height: 18),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _Stat(
+                                label: 'A day so far',
+                                value: moneyShort(
+                                  elapsed <= 0 ? total : total ~/ elapsed,
+                                  symbol,
+                                ),
+                              ),
+                            ),
+                            Container(
+                              width: 1,
+                              height: 30,
+                              color: Theme.of(context)
+                                  .colorScheme
+                                  .outlineVariant,
+                            ),
+                            Expanded(
+                              child: _Stat(
+                                label: 'Biggest slice',
+                                value: byCategory.first.$1,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SectionHeading(title: 'By category'),
+                _Panel(
+                  padding: const EdgeInsets.fromLTRB(16, 6, 16, 10),
+                  child: Column(
+                    children: [
+                      for (final e in byCategory)
+                        _CategoryBar(
+                          category: e.$1,
+                          amountMinor: e.$2,
+                          share: e.$2 / total,
+                          symbol: symbol,
+                        ),
+                    ],
+                  ),
+                ),
+                SectionHeading(
+                  title: 'Day by day',
+                  caption: state.hasBudget
+                      ? '${_dm(period.start)} to '
+                            '${_dm(period.end.subtract(const Duration(days: 1)))} · '
+                            'dashed line is an even '
+                            '${moneyShort(state.budgetMinor ~/ _days(period), symbol)} a day'
+                      : '${_dm(period.start)} to '
+                            '${_dm(period.end.subtract(const Duration(days: 1)))}',
+                ),
+                RepaintBoundary(
+                  child: _Panel(
+                    child: SizedBox(
+                      height: 200,
+                      child: _DailyBarChart(
+                        period: period,
+                        byDay: state.byDay,
+                        budgetMinor: state.budgetMinor,
+                        symbol: symbol,
+                      ),
+                    ),
+                  ),
+                ),
+                SectionHeading(
+                  title: 'Counted in budget',
+                  caption: state.budgetRowCount > counted.length
+                      ? 'Showing ${counted.length} of ${state.budgetRowCount} transactions'
+                      : '${state.budgetRowCount} transactions',
+                ),
+              ],
             ),
           ),
-          const SizedBox(height: 28),
-          Text('Daily spend', style: Theme.of(context).textTheme.titleLarge),
-          const SizedBox(height: 4),
-          Text(
-            '${period.start.day}/${period.start.month} - '
-            '${period.end.subtract(const Duration(days: 1)).day}/'
-            '${period.end.subtract(const Duration(days: 1)).month}',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 16),
-          SizedBox(
-            height: 220,
-            child: _DailyBarChart(
-              period: period,
-              byDay: byDay,
-              budgetMinor: budget,
-              symbol: symbol,
+          SliverPadding(
+            padding: EdgeInsets.fromLTRB(
+              20,
+              0,
+              20,
+              110 + MediaQuery.viewPaddingOf(context).bottom,
             ),
-          ),
-          const SizedBox(height: 28),
-          Text(
-            'Counted in budget',
-            style: Theme.of(context).textTheme.titleLarge,
-          ),
-          Text(
-            countedTotal > counted.length
-                ? 'Showing ${counted.length} of $countedTotal transactions'
-                : '$countedTotal transactions',
-            style: Theme.of(context).textTheme.bodySmall,
-          ),
-          const SizedBox(height: 8),
-          ListView.builder(
-            shrinkWrap: true,
-            physics: const NeverScrollableScrollPhysics(),
-            itemCount: counted.length,
-            itemBuilder: (_, i) =>
-                TransactionTile(transaction: counted[i], symbol: symbol),
+            sliver: SliverList.builder(
+              itemCount: counted.length,
+              itemBuilder: (context, i) =>
+                  TransactionTile(transaction: counted[i], symbol: symbol),
+            ),
           ),
         ],
       );
@@ -96,6 +150,50 @@ class InsightsScreen extends StatelessWidget {
   );
 }
 
+String _dm(DateTime d) => '${d.day}/${d.month}';
+
+int _days(BudgetPeriod p) => p.end.difference(p.start).inDays;
+
+/// A raised surface for a chart or a group of rows, so a figure never floats
+/// loose on the page.
+class _Panel extends StatelessWidget {
+  const _Panel({required this.child, this.padding});
+  final Widget child;
+  final EdgeInsets? padding;
+
+  @override
+  Widget build(BuildContext context) => Container(
+    decoration: raisedDecoration(Theme.of(context).colorScheme),
+    padding: padding ?? const EdgeInsets.fromLTRB(16, 18, 16, 16),
+    child: child,
+  );
+}
+
+class _Stat extends StatelessWidget {
+  const _Stat({required this.label, required this.value});
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Column(
+      children: [
+        Text(
+          value,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: text.titleLarge?.copyWith(fontFeatures: tabular),
+        ),
+        const SizedBox(height: 1),
+        Text(label, style: text.bodySmall),
+      ],
+    );
+  }
+}
+
+/// The ring, with the period total sitting in the hole. Slice labels are left
+/// off on purpose: the share bars underneath say the same thing in words.
 class _CategoryDonut extends StatelessWidget {
   const _CategoryDonut({
     required this.byCategory,
@@ -107,69 +205,107 @@ class _CategoryDonut extends StatelessWidget {
   final String symbol;
 
   @override
-  Widget build(BuildContext context) => SizedBox(
-    height: 180,
-    child: PieChart(
-      PieChartData(
-        centerSpaceRadius: 50,
-        sectionsSpace: 2,
-        sections: byCategory
-            .map(
-              (e) => PieChartSectionData(
-                value: e.$2.toDouble(),
-                color: categoryColor(e.$1),
-                title: total == 0 ? '' : '${(e.$2 * 100 / total).round()}%',
-                radius: 40,
-                titleStyle: const TextStyle(
-                  fontSize: 11,
-                  fontWeight: FontWeight.w600,
-                  color: Colors.white,
+  Widget build(BuildContext context) {
+    final text = Theme.of(context).textTheme;
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        PieChart(
+          PieChartData(
+            centerSpaceRadius: 68,
+            sectionsSpace: 3,
+            startDegreeOffset: -90,
+            sections: [
+              for (final e in byCategory)
+                PieChartSectionData(
+                  value: e.$2.toDouble(),
+                  color: categoryColor(e.$1),
+                  title: '',
+                  radius: 26,
+                ),
+            ],
+          ),
+        ),
+        Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                child: Text(
+                  moneyShort(total, symbol),
+                  maxLines: 1,
+                  style: text.displaySmall?.copyWith(fontFeatures: tabular),
                 ),
               ),
-            )
-            .toList(),
-      ),
-    ),
-  );
+            ),
+            Text('this period', style: text.bodySmall),
+          ],
+        ),
+      ],
+    );
+  }
 }
 
-class _CategoryLegendRow extends StatelessWidget {
-  const _CategoryLegendRow({
+/// One category as a row plus the share of the period it took. A bar reads
+/// faster than a colour key against a ring.
+class _CategoryBar extends StatelessWidget {
+  const _CategoryBar({
     required this.category,
     required this.amountMinor,
+    required this.share,
     required this.symbol,
   });
   final String category;
   final int amountMinor;
+  final double share;
   final String symbol;
 
   @override
-  Widget build(BuildContext context) => Padding(
-    padding: const EdgeInsets.symmetric(vertical: 6),
-    child: Row(
-      children: [
-        Container(
-          width: 10,
-          height: 10,
-          decoration: BoxDecoration(
-            color: categoryColor(category),
-            shape: BoxShape.circle,
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final text = Theme.of(context).textTheme;
+    final color = categoryColor(category);
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 9),
+      child: Column(
+        children: [
+          Row(
+            children: [
+              Icon(categoryIcon(category), size: 16, color: color),
+              const SizedBox(width: 9),
+              Expanded(child: Text(category, style: text.bodyMedium)),
+              Text(
+                '${(share * 100).round()}%',
+                style: text.bodySmall?.copyWith(fontFeatures: tabular),
+              ),
+              const SizedBox(width: 12),
+              Text(
+                money(amountMinor, symbol),
+                style: text.titleMedium?.copyWith(fontFeatures: tabular),
+              ),
+            ],
           ),
-        ),
-        const SizedBox(width: 10),
-        Icon(categoryIcon(category), size: 16, color: categoryColor(category)),
-        const SizedBox(width: 8),
-        Expanded(child: Text(category)),
-        Text(
-          money(amountMinor, symbol),
-          style: const TextStyle(
-            fontWeight: FontWeight.w600,
-            fontFeatures: tabular,
+          const SizedBox(height: 7),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(3),
+            child: TweenAnimationBuilder<double>(
+              tween: Tween(begin: 0, end: share.clamp(0.0, 1.0)),
+              duration: const Duration(milliseconds: 560),
+              curve: Curves.easeOutCubic,
+              builder: (context, value, _) => LinearProgressIndicator(
+                value: value,
+                minHeight: 5,
+                backgroundColor: scheme.surfaceContainerHigh,
+                valueColor: AlwaysStoppedAnimation(color),
+              ),
+            ),
           ),
-        ),
-      ],
-    ),
-  );
+        ],
+      ),
+    );
+  }
 }
 
 class _DailyBarChart extends StatelessWidget {
@@ -188,35 +324,92 @@ class _DailyBarChart extends StatelessWidget {
   Widget build(BuildContext context) {
     final days = period.end.difference(period.start).inDays;
     final scheme = Theme.of(context).colorScheme;
+    final today = DateTime.now();
     final bars = <BarChartGroupData>[];
     var maxY = 0.0;
     for (var i = 0; i < days; i++) {
       final day = period.start.add(Duration(days: i));
       final amount = (byDay[day] ?? 0) / 100.0;
       if (amount > maxY) maxY = amount;
+      final future = day.isAfter(today);
       bars.add(
         BarChartGroupData(
           x: i,
           barRods: [
-            BarChartRodData(toY: amount, color: scheme.primary, width: 6),
+            BarChartRodData(
+              toY: amount,
+              // Days still to come are drawn flat, so the chart doesn't read
+              // as a run of zero-spend days that have already happened.
+              color: future
+                  ? scheme.outlineVariant
+                  : amount == 0
+                  ? scheme.surfaceContainerHigh
+                  : scheme.primary,
+              width: days > 28 ? 7 : 9,
+              borderRadius: const BorderRadius.vertical(
+                top: Radius.circular(3),
+              ),
+            ),
           ],
         ),
       );
     }
     final dailyPace = budgetMinor > 0 ? (budgetMinor / days) / 100.0 : null;
     if (dailyPace != null && dailyPace > maxY) maxY = dailyPace;
+    final labelStyle = Theme.of(context).textTheme.labelSmall
+        ?.copyWith(color: scheme.onSurfaceVariant);
     return BarChart(
       BarChartData(
-        maxY: maxY == 0 ? 1 : maxY * 1.15,
+        maxY: maxY == 0 ? 1 : maxY * 1.18,
         barGroups: bars,
-        gridData: const FlGridData(show: false),
+        gridData: FlGridData(
+          show: true,
+          drawVerticalLine: false,
+          getDrawingHorizontalLine: (_) =>
+              FlLine(color: scheme.outlineVariant, strokeWidth: 1),
+        ),
         borderData: FlBorderData(show: false),
-        titlesData: const FlTitlesData(
-          topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
-          leftTitles: AxisTitles(
-            sideTitles: SideTitles(showTitles: true, reservedSize: 40),
+        barTouchData: BarTouchData(
+          touchTooltipData: BarTouchTooltipData(
+            getTooltipColor: (_) => scheme.inverseSurface,
+            getTooltipItem: (group, _, rod, _) => BarTooltipItem(
+              '${_dm(period.start.add(Duration(days: group.x)))}\n'
+              '${money((rod.toY * 100).round(), symbol)}',
+              TextStyle(
+                fontFamily: 'Nunito',
+                fontWeight: FontWeight.w700,
+                fontSize: 12,
+                color: scheme.onInverseSurface,
+              ),
+            ),
+          ),
+        ),
+        titlesData: FlTitlesData(
+          topTitles: const AxisTitles(
+            sideTitles: SideTitles(showTitles: false),
+          ),
+          rightTitles: const AxisTitles(
+            sideTitles: SideTitles(showTitles: false),
+          ),
+          leftTitles: const AxisTitles(
+            sideTitles: SideTitles(showTitles: false),
+          ),
+          bottomTitles: AxisTitles(
+            sideTitles: SideTitles(
+              showTitles: true,
+              reservedSize: 22,
+              interval: 1,
+              getTitlesWidget: (value, meta) {
+                final day = period.start.add(Duration(days: value.toInt()));
+                // Every fifth day plus the first, or the axis turns to mush.
+                if (day.day != 1 && day.day % 5 != 0)
+                  return const SizedBox.shrink();
+                return Padding(
+                  padding: const EdgeInsets.only(top: 6),
+                  child: Text('${day.day}', style: labelStyle),
+                );
+              },
+            ),
           ),
         ),
         extraLinesData: dailyPace == null
@@ -225,15 +418,11 @@ class _DailyBarChart extends StatelessWidget {
                 horizontalLines: [
                   HorizontalLine(
                     y: dailyPace,
-                    color: scheme.error,
+                    color: scheme.onSurface.withValues(alpha: 0.55),
                     strokeWidth: 1.5,
-                    dashArray: [6, 4],
-                    label: HorizontalLineLabel(
-                      show: true,
-                      alignment: Alignment.topRight,
-                      style: TextStyle(color: scheme.error, fontSize: 10),
-                      labelResolver: (_) => 'Daily pace',
-                    ),
+                    dashArray: [5, 5],
+                    // No inline label: at 30 bars it lands on top of one.
+                    // The section caption carries the figure instead.
                   ),
                 ],
               ),

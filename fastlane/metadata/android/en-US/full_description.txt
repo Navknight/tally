@@ -1,0 +1,38 @@
+Tally is a budget tracker that keeps itself up to date.
+
+Indian banks and UPI apps already text you every time money moves. Tally reads
+those messages on your phone, works out the amount, the merchant and the
+account, and files the transaction. You set a spending limit for the period and
+Tally tells you where you stand against it — not just how much is gone, but
+whether that is early or late for the day you are on.
+
+<b>Everything stays on your phone.</b>
+Tally has no internet permission at all. There is no account to make, no server
+to sync with, no analytics and no ads. Your ledger is one database file on the
+device; uninstalling deletes it.
+
+<b>What it does</b>
+
+* Reads bank and UPI transaction SMS and records them automatically. Messages
+  that are not about a transaction are skipped and never stored.
+* Tracks several accounts and credit cards, matched by the last four digits
+  each bank quotes. It notices accounts it has never seen and offers to add
+  them.
+* Learns your categories. Label a merchant once and Tally applies it to past
+  and future transactions — no bundled language model, just a small lookup
+  table and some counting.
+* One spending limit per period, with a pace marker so you can see whether you
+  are ahead or behind for the day of the month.
+* Charts the period by category and day by day.
+* Imports CSV and PDF bank statements to seed history.
+* Exports the whole ledger to CSV whenever you want it.
+* Follows your system light and dark theme.
+
+<b>Permissions</b>
+
+READ_SMS is used for one thing: parsing transaction messages on the device so
+the ledger fills itself in. It is optional — you can skip it entirely and use
+manual entry and statement import instead. Nothing is transmitted anywhere.
+
+Tally is free software under the GNU GPL v3. Source and issue tracker:
+https://github.com/Navknight/tally
