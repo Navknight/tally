@@ -4,6 +4,7 @@ import 'package:sqflite/sqflite.dart';
 import '../core/budget_period.dart';
 import '../models/account.dart';
 import '../models/categories.dart';
+import '../models/category_def.dart';
 import '../models/detected_account.dart';
 import '../models/transaction.dart';
 import '../models/transfer.dart';
@@ -18,7 +19,7 @@ class TallyDatabase implements CategoryStore {
 
   Future<Database> get _db async => _database ??= await openDatabase(
     join(await getDatabasesPath(), 'tally.db'),
-    version: 5,
+    version: 6,
     onCreate: (db, _) async {
       await db.execute('''CREATE TABLE settings (
             key TEXT PRIMARY KEY, value TEXT NOT NULL)''');
@@ -41,6 +42,7 @@ class TallyDatabase implements CategoryStore {
       );
       await _createV3(db);
       await _createV5(db);
+      await _createV6(db);
     },
     onUpgrade: (db, oldVersion, _) async {
       if (oldVersion < 2) {
@@ -91,6 +93,10 @@ class TallyDatabase implements CategoryStore {
           await db.execute('ALTER TABLE transactions ADD COLUMN $column');
         await _createV5(db);
       }
+      // Last, and unconditional below 6, so it also runs for a database
+      // jumping straight from an older version: the branches above can skip
+      // each other, and CREATE TABLE IF NOT EXISTS makes a repeat harmless.
+      if (oldVersion < 6) await _createV6(db);
     },
   );
 
@@ -148,6 +154,105 @@ class TallyDatabase implements CategoryStore {
   }
 
   // ---------------------------------------------------------------- settings
+
+  /// v6: categories become rows so the user can add, recolour and delete
+  /// them. Seeded from the built-in list, which stays the fallback for a
+  /// transaction whose category was deleted.
+  static Future<void> _createV6(Database db) async {
+    await db.execute('''CREATE TABLE IF NOT EXISTS categories (
+            name TEXT PRIMARY KEY, icon_index INTEGER NOT NULL,
+            color_value INTEGER NOT NULL, sort_order INTEGER NOT NULL,
+            builtin INTEGER NOT NULL DEFAULT 0)''');
+    final batch = db.batch();
+    for (var i = 0; i < kCategories.length; i++) {
+      final name = kCategories[i];
+      batch.insert('categories', {
+        'name': name,
+        'icon_index': kCategoryIconChoices.indexOf(categoryIcon(name)),
+        'color_value': categoryColor(name).toARGB32(),
+        'sort_order': i,
+        'builtin': 1,
+      }, conflictAlgorithm: ConflictAlgorithm.ignore);
+    }
+    await batch.commit(noResult: true);
+  }
+
+  /// How many transactions carry each category, so the manage screen can say
+  /// what a delete would actually move.
+  Future<Map<String, int>> categoryUsage() async {
+    final rows = await (await _db).rawQuery(
+      'SELECT category, COUNT(*) AS n FROM transactions GROUP BY category',
+    );
+    return {
+      for (final row in rows)
+        row['category'] as String: (row['n'] as int?) ?? 0,
+    };
+  }
+
+  Future<List<CategoryDef>> categories() async => (await _db)
+      .query('categories', orderBy: 'sort_order, name')
+      .then((rows) => rows.map(CategoryDef.fromMap).toList());
+
+  Future<void> saveCategory(CategoryDef category, {String? renamedFrom}) async {
+    final db = await _db;
+    await db.transaction((txn) async {
+      if (renamedFrom != null && renamedFrom != category.name) {
+        await txn.delete(
+          'categories',
+          where: 'name = ?',
+          whereArgs: [renamedFrom],
+        );
+        // Every row, rule and counter that named the old category has to move
+        // with it, or the rename silently orphans history.
+        for (final table in const ['transactions', 'merchant_rules']) {
+          await txn.update(
+            table,
+            {'category': category.name},
+            where: 'category = ?',
+            whereArgs: [renamedFrom],
+          );
+        }
+        await txn.update(
+          'category_stats',
+          {'category': category.name},
+          where: 'category = ?',
+          whereArgs: [renamedFrom],
+        );
+        await txn.update(
+          'token_stats',
+          {'category': category.name},
+          where: 'category = ?',
+          whereArgs: [renamedFrom],
+        );
+      }
+      await txn.insert(
+        'categories',
+        category.toMap(),
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
+    });
+  }
+
+  /// Removes a category and moves everything that used it to [reassignTo].
+  /// A transaction is never left pointing at a label that no longer exists.
+  Future<void> deleteCategory(String name, String reassignTo) async {
+    final db = await _db;
+    await db.transaction((txn) async {
+      await txn.update(
+        'transactions',
+        {'category': reassignTo},
+        where: 'category = ?',
+        whereArgs: [name],
+      );
+      await txn.update(
+        'merchant_rules',
+        {'category': reassignTo},
+        where: 'category = ?',
+        whereArgs: [name],
+      );
+      await txn.delete('categories', where: 'name = ?', whereArgs: [name]);
+    });
+  }
 
   Future<String?> setting(String key) async => (await _db)
       .query('settings', columns: ['value'], where: 'key = ?', whereArgs: [key])
@@ -213,6 +318,54 @@ class TallyDatabase implements CategoryStore {
     where: 'id = ?',
     whereArgs: [account.id],
   );
+
+  /// Folds [fromId] into [intoId]: every transaction, both as the account it
+  /// was booked on and as a transfer's destination, plus the digits it
+  /// answered to. The surviving account keeps its own balance anchor, since
+  /// that is the one the bank last confirmed.
+  ///
+  /// Detection can produce two rows for one real account - a bank that quotes
+  /// four digits in some messages and six in others - and without this the
+  /// only fix was deleting one and losing its history.
+  Future<void> mergeAccounts(int fromId, int intoId) async {
+    if (fromId == intoId) return;
+    final db = await _db;
+    await db.transaction((txn) async {
+      final rows = await txn.query(
+        'accounts',
+        where: 'id IN (?, ?)',
+        whereArgs: [fromId, intoId],
+      );
+      final from = rows.firstWhere((r) => r['id'] == fromId);
+      final into = rows.firstWhere((r) => r['id'] == intoId);
+      await txn.update(
+        'transactions',
+        {'account_id': intoId},
+        where: 'account_id = ?',
+        whereArgs: [fromId],
+      );
+      await txn.update(
+        'transactions',
+        {'transfer_account_id': intoId},
+        where: 'transfer_account_id = ?',
+        whereArgs: [fromId],
+      );
+      // Keep both sets of digits so messages quoting either still match.
+      final digits = {
+        ...(into['last4'] as String? ?? '').split(RegExp(r'[^0-9]+')),
+        ...(from['last4'] as String? ?? '').split(RegExp(r'[^0-9]+')),
+      }..removeWhere((d) => d.isEmpty);
+      await txn.update(
+        'accounts',
+        {'last4': digits.join(' ')},
+        where: 'id = ?',
+        whereArgs: [intoId],
+      );
+      await txn.delete('accounts', where: 'id = ?', whereArgs: [fromId]);
+    });
+    // A transfer pair split across the two accounts can now be seen as one.
+    await linkSelfTransfers();
+  }
 
   Future<void> deleteAccount(int id) async {
     final db = await _db;
@@ -390,30 +543,141 @@ class TallyDatabase implements CategoryStore {
 
   // ------------------------------------------------------------ transactions
 
-  /// The ledger, newest first. [before] windows it to rows older than that
-  /// instant, which is how Activity jumps back to a chosen day without paging
-  /// through everything in between.
+  /// The ledger, newest first. [from] and [to] are a half-open window, which
+  /// is how Activity both jumps back to a chosen day and shows exactly one;
+  /// [category], [accountId], [search] and the amount bounds narrow it the
+  /// way the filter bar does.
   Future<List<TallyTransaction>> transactions({
     int limit = 500,
     int? accountId,
-    DateTime? before,
+    DateTime? from,
+    DateTime? to,
+    String? category,
+    String? search,
+    int? minMinor,
+    int? maxMinor,
   }) async {
-    final clauses = [
-      if (accountId != null) 'account_id = ?',
-      if (before != null) 'occurred_at < ?',
-    ];
+    final (where, args) = _ledgerWhere(
+      accountId: accountId,
+      from: from,
+      to: to,
+      category: category,
+      search: search,
+      minMinor: minMinor,
+      maxMinor: maxMinor,
+    );
     return (await _db)
         .query(
           'transactions',
-          where: clauses.isEmpty ? null : clauses.join(' AND '),
-          whereArgs: [
-            ?accountId,
-            if (before != null) before.millisecondsSinceEpoch,
-          ],
+          where: where,
+          whereArgs: args,
           orderBy: 'occurred_at DESC',
           limit: limit,
         )
         .then((rows) => rows.map(TallyTransaction.fromMap).toList());
+  }
+
+  /// Every id the filter matches, for "select all" on a list that is paged:
+  /// selecting what is on screen is not what the user means when the screen
+  /// shows sixty of four hundred.
+  Future<List<int>> ledgerIds({
+    int? accountId,
+    DateTime? from,
+    DateTime? to,
+    String? category,
+    String? search,
+    int? minMinor,
+    int? maxMinor,
+  }) async {
+    final (where, args) = _ledgerWhere(
+      accountId: accountId,
+      from: from,
+      to: to,
+      category: category,
+      search: search,
+      minMinor: minMinor,
+      maxMinor: maxMinor,
+    );
+    final rows = await (await _db).query(
+      'transactions',
+      columns: ['id'],
+      where: where,
+      whereArgs: args,
+      orderBy: 'occurred_at DESC',
+    );
+    return [for (final row in rows) row['id'] as int];
+  }
+
+  /// How many rows the same filter matches and what they add up to, so the
+  /// list can say "42 transactions - 12,340" without loading all of them.
+  /// Money in and money out are counted apart: adding them would be nonsense.
+  Future<(int, int, int)> ledgerSummary({
+    int? accountId,
+    DateTime? from,
+    DateTime? to,
+    String? category,
+    String? search,
+    int? minMinor,
+    int? maxMinor,
+  }) async {
+    final (where, args) = _ledgerWhere(
+      accountId: accountId,
+      from: from,
+      to: to,
+      category: category,
+      search: search,
+      minMinor: minMinor,
+      maxMinor: maxMinor,
+    );
+    final rows = await (await _db).rawQuery(
+      'SELECT COUNT(*) AS n, '
+      "COALESCE(SUM(CASE WHEN kind = 'expense' THEN amount_minor END), 0) AS out, "
+      "COALESCE(SUM(CASE WHEN kind = 'income' THEN amount_minor END), 0) AS inn "
+      'FROM transactions${where == null ? '' : ' WHERE $where'}',
+      args,
+    );
+    final row = rows.first;
+    return (
+      (row['n'] as int?) ?? 0,
+      (row['out'] as int?) ?? 0,
+      (row['inn'] as int?) ?? 0,
+    );
+  }
+
+  /// One place builds the ledger's WHERE clause, so the list and the summary
+  /// underneath it can never disagree about what is being shown.
+  (String?, List<Object?>) _ledgerWhere({
+    int? accountId,
+    DateTime? from,
+    DateTime? to,
+    String? category,
+    String? search,
+    int? minMinor,
+    int? maxMinor,
+  }) {
+    final text = search?.trim();
+    final clauses = [
+      if (accountId != null) 'account_id = ?',
+      if (from != null) 'occurred_at >= ?',
+      if (to != null) 'occurred_at < ?',
+      if (category != null) 'category = ?',
+      if (minMinor != null) 'amount_minor >= ?',
+      if (maxMinor != null) 'amount_minor <= ?',
+      if (text != null && text.isNotEmpty)
+        '(merchant LIKE ? COLLATE NOCASE OR note LIKE ? COLLATE NOCASE)',
+    ];
+    return (
+      clauses.isEmpty ? null : clauses.join(' AND '),
+      [
+        ?accountId,
+        if (from != null) from.millisecondsSinceEpoch,
+        if (to != null) to.millisecondsSinceEpoch,
+        ?category,
+        ?minMinor,
+        ?maxMinor,
+        if (text != null && text.isNotEmpty) ...['%$text%', '%$text%'],
+      ],
+    );
   }
 
   /// When the ledger starts, for the date picker's lower bound. Null when
@@ -508,6 +772,36 @@ class TallyDatabase implements CategoryStore {
       .query('transactions', where: "source = 'sms'")
       .then((rows) => rows.map(TallyTransaction.fromMap).toList());
 
+  /// Sets one category on many rows at once. Deliberately does not sweep the
+  /// merchants involved the way a single correction does: a batch is usually
+  /// a mixed bag, and teaching the learner from it would poison rules the
+  /// user set one row at a time.
+  Future<int> setCategoryForIds(List<int> ids, String category) async {
+    if (ids.isEmpty) return 0;
+    final marks = List.filled(ids.length, '?').join(',');
+    return (await _db).rawUpdate(
+      'UPDATE transactions SET category = ?, category_source = ?, '
+      'needs_review = 0, exclude_from_budget = CASE WHEN ? = 1 THEN 1 '
+      'ELSE exclude_from_budget END WHERE id IN ($marks)',
+      [
+        category,
+        CategorySource.manual.name,
+        category == kInvestments ? 1 : 0,
+        ...ids,
+      ],
+    );
+  }
+
+  /// Takes many rows in or out of the budget at once.
+  Future<int> setExcludedForIds(List<int> ids, bool excluded) async {
+    if (ids.isEmpty) return 0;
+    final marks = List.filled(ids.length, '?').join(',');
+    return (await _db).rawUpdate(
+      'UPDATE transactions SET exclude_from_budget = ? WHERE id IN ($marks)',
+      [excluded ? 1 : 0, ...ids],
+    );
+  }
+
   Future<void> deleteByIds(List<int> ids) async {
     if (ids.isEmpty) return;
     await (await _db).delete(
@@ -567,9 +861,11 @@ class TallyDatabase implements CategoryStore {
   Future<(List<TallyTransaction>, int)> budgetRowsPage(
     BudgetPeriod period, {
     int limit = 200,
+    bool budgetedOnly = true,
   }) async {
-    const filter =
-        't.kind = ? AND t.exclude_from_budget = 0 AND a.in_budget = 1 '
+    final join = _scopeJoin(budgetedOnly);
+    final filter =
+        't.kind = ? ${_scopeFilter(budgetedOnly)} '
         'AND t.occurred_at >= ? AND t.occurred_at < ?';
     final args = [
       TransactionKind.expense.name,
@@ -578,17 +874,85 @@ class TallyDatabase implements CategoryStore {
     ];
     final db = await _db;
     final countRows = await db.rawQuery(
-      'SELECT COUNT(*) AS c FROM transactions t JOIN accounts a ON a.id = t.account_id WHERE $filter',
+      'SELECT COUNT(*) AS c FROM transactions t $join WHERE $filter',
       args,
     );
     final count = (countRows.first['c'] as int?) ?? 0;
     final rows = await db.rawQuery(
-      'SELECT t.* FROM transactions t JOIN accounts a ON a.id = t.account_id '
+      'SELECT t.* FROM transactions t $join '
       'WHERE $filter ORDER BY t.occurred_at DESC LIMIT ?',
       [...args, limit],
     );
     return (rows.map(TallyTransaction.fromMap).toList(), count);
   }
+
+  /// Insights' two scopes differ only in whether the budget's exclusions
+  /// apply, so both the join and the extra conditions come from one place.
+  static String _scopeJoin(bool budgetedOnly) =>
+      budgetedOnly ? 'JOIN accounts a ON a.id = t.account_id' : '';
+
+  static String _scopeFilter(bool budgetedOnly) =>
+      budgetedOnly ? 'AND t.exclude_from_budget = 0 AND a.in_budget = 1' : '';
+
+  /// Who took the most money in [period]. "Where did it go" is usually a
+  /// question about merchants, not categories, and the ring cannot answer it.
+  Future<List<(String, int, int)>> topMerchants(
+    BudgetPeriod period, {
+    bool budgetedOnly = true,
+    int limit = 6,
+  }) async {
+    final rows = await (await _db).rawQuery(
+      'SELECT t.merchant AS merchant, SUM(t.amount_minor) AS total, '
+      'COUNT(*) AS n FROM transactions t ${_scopeJoin(budgetedOnly)} '
+      'WHERE t.kind = ? ${_scopeFilter(budgetedOnly)} '
+      "AND t.merchant != '' "
+      'AND t.occurred_at >= ? AND t.occurred_at < ? '
+      'GROUP BY t.merchant COLLATE NOCASE ORDER BY total DESC LIMIT ?',
+      [
+        TransactionKind.expense.name,
+        period.start.millisecondsSinceEpoch,
+        period.end.millisecondsSinceEpoch,
+        limit,
+      ],
+    );
+    return [
+      for (final row in rows)
+        (
+          row['merchant'] as String,
+          (row['total'] as int?) ?? 0,
+          (row['n'] as int?) ?? 0,
+        ),
+    ];
+  }
+
+  /// What came in during [period], the counterpart to the category ring.
+  Future<int> incomeInPeriod(
+    BudgetPeriod period, {
+    bool budgetedOnly = true,
+  }) async {
+    final rows = await (await _db).rawQuery(
+      'SELECT COALESCE(SUM(t.amount_minor), 0) AS total '
+      'FROM transactions t ${_scopeJoin(budgetedOnly)} '
+      'WHERE t.kind = ? ${_scopeFilter(budgetedOnly)} '
+      'AND t.occurred_at >= ? AND t.occurred_at < ?',
+      [
+        TransactionKind.income.name,
+        period.start.millisecondsSinceEpoch,
+        period.end.millisecondsSinceEpoch,
+      ],
+    );
+    return (rows.first['total'] as int?) ?? 0;
+  }
+
+  /// Puts a deleted row back exactly as it was, id included, so an undo
+  /// restores the thing that was removed rather than a copy of it. Skips the
+  /// dedup checks in [add] on purpose: this row was already in the ledger.
+  Future<void> restore(TallyTransaction transaction) async =>
+      (await _db).insert(
+        'transactions',
+        transaction.toMap()..['id'] = transaction.id,
+        conflictAlgorithm: ConflictAlgorithm.replace,
+      );
 
   Future<void> delete(int id) async =>
       (await _db).delete('transactions', where: 'id = ?', whereArgs: [id]);
@@ -751,15 +1115,25 @@ class TallyDatabase implements CategoryStore {
 
   /// Categories with budget-counted spend inside [period], largest first.
   /// Computed in SQL so the UI never walks the whole table.
-  Future<List<(String, int)>> spendByCategory(BudgetPeriod period) async {
+  /// Spend by category inside [period].
+  ///
+  /// [budgetedOnly] false widens it past the budget: every account, including
+  /// ones switched off, and rows flagged out of the budget. Insights offers
+  /// both because "what am I allowed to spend" and "where did my money go"
+  /// are different questions, and the app could only answer the first.
+  Future<List<(String, int)>> spendByCategory(
+    BudgetPeriod period, {
+    bool budgetedOnly = true,
+    TransactionKind kind = TransactionKind.expense,
+  }) async {
     final rows = await (await _db).rawQuery(
-      '''SELECT t.category AS category, SUM(t.amount_minor) AS total FROM transactions t
-         JOIN accounts a ON a.id = t.account_id
-         WHERE t.kind = ? AND t.exclude_from_budget = 0 AND a.in_budget = 1
-           AND t.occurred_at >= ? AND t.occurred_at < ?
-         GROUP BY t.category ORDER BY total DESC''',
+      'SELECT t.category AS category, SUM(t.amount_minor) AS total '
+      'FROM transactions t ${_scopeJoin(budgetedOnly)} '
+      'WHERE t.kind = ? ${_scopeFilter(budgetedOnly)} '
+      'AND t.occurred_at >= ? AND t.occurred_at < ? '
+      'GROUP BY t.category ORDER BY total DESC',
       [
-        TransactionKind.expense.name,
+        kind.name,
         period.start.millisecondsSinceEpoch,
         period.end.millisecondsSinceEpoch,
       ],
@@ -771,12 +1145,15 @@ class TallyDatabase implements CategoryStore {
 
   /// Budget-counted spend for each calendar day inside [period], keyed by the
   /// day's midnight timestamp so days with no spend can still show a bar.
-  Future<Map<DateTime, int>> dailySpend(BudgetPeriod period) async {
+  Future<Map<DateTime, int>> dailySpend(
+    BudgetPeriod period, {
+    bool budgetedOnly = true,
+  }) async {
     final rows = await (await _db).rawQuery(
-      '''SELECT t.occurred_at AS at, t.amount_minor AS amount FROM transactions t
-         JOIN accounts a ON a.id = t.account_id
-         WHERE t.kind = ? AND t.exclude_from_budget = 0 AND a.in_budget = 1
-           AND t.occurred_at >= ? AND t.occurred_at < ?''',
+      'SELECT t.occurred_at AS at, t.amount_minor AS amount '
+      'FROM transactions t ${_scopeJoin(budgetedOnly)} '
+      'WHERE t.kind = ? ${_scopeFilter(budgetedOnly)} '
+      'AND t.occurred_at >= ? AND t.occurred_at < ?',
       [
         TransactionKind.expense.name,
         period.start.millisecondsSinceEpoch,

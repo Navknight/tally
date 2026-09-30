@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:fl_chart/fl_chart.dart';
 import 'package:flutter/material.dart';
 
@@ -5,149 +7,237 @@ import 'app/theme.dart';
 import 'app/ui.dart';
 import 'core/budget_period.dart';
 import 'core/money.dart';
-import 'main.dart' show TallyPage, TransactionTile;
+import 'main.dart'
+    show
+        PageBottomGap,
+        PageColumn,
+        TallyPage,
+        TransactionTile,
+        showTransactionSheet;
+import 'state/app_state.dart';
 import 'models/categories.dart';
 
 /// Where the period's money went: a ring with the total in the middle, the
 /// categories under it as share bars, the same period day by day, and finally
 /// the rows the budget actually counted.
 class InsightsScreen extends StatelessWidget {
-  const InsightsScreen({super.key});
+  const InsightsScreen({super.key, required this.onOpenActivity});
+
+  /// Drilling into a slice narrows the ledger and shows it, rather than
+  /// building a second, slightly different list here.
+  final VoidCallback onOpenActivity;
+
+  Future<void> _drillInto(String category) async {
+    await appState.setFilter(
+      appState.filter.copyWith(category: category, text: ''),
+    );
+    onOpenActivity();
+  }
 
   @override
   Widget build(BuildContext context) => TallyPage(
     title: 'Insights',
-    builder: (context, state) {
+    slivers: (context, state) {
       final byCategory = state.byCategory;
       final total = byCategory.fold<int>(0, (sum, e) => sum + e.$2);
       if (total == 0)
-        return const EmptyState(
-          icon: Icons.donut_small_outlined,
-          title: 'Nothing to chart yet',
-          message:
-              'Once this budget period has some spending in it, the '
-              'breakdown shows up here.',
-        );
-      final period = state.period;
+        return [
+          PageColumn(
+            children: [
+              const _ScopeBar(),
+              const SizedBox(height: 40),
+              EmptyState(
+                icon: Icons.donut_small_outlined,
+                title: 'Nothing to chart here',
+                message: state.insightsBudgetedOnly
+                    ? 'No budgeted spending in this range. Try All time, or '
+                          'switch to every account.'
+                    : 'No spending in this range yet.',
+                embedded: true,
+              ),
+            ],
+          ),
+        ];
+      final period = state.insightsPeriod;
       final symbol = state.symbol;
       final elapsed = DateTime.now().difference(period.start).inDays + 1;
       final counted = state.budgetRows;
       // A CustomScrollView, not a ListView: the counted rows can run to two
       // hundred, and a plain ListView would build every one of them before it
       // could paint the chart above.
-      return CustomScrollView(
-        slivers: [
-          SliverPadding(
-            padding: const EdgeInsets.fromLTRB(20, 4, 20, 0),
-            sliver: SliverList.list(
-              children: [
-                RepaintBoundary(
-                  child: _Panel(
-                    child: Column(
+      return [
+        PageColumn(
+          children: [
+            const _ScopeBar(),
+            const SizedBox(height: 14),
+            RepaintBoundary(
+              child: _Panel(
+                child: Column(
+                  children: [
+                    SizedBox(
+                      height: 210,
+                      child: _CategoryDonut(
+                        byCategory: byCategory,
+                        total: total,
+                        symbol: symbol,
+                        onTap: _drillInto,
+                      ),
+                    ),
+                    const SizedBox(height: 18),
+                    Row(
                       children: [
-                        SizedBox(
-                          height: 210,
-                          child: _CategoryDonut(
-                            byCategory: byCategory,
-                            total: total,
-                            symbol: symbol,
+                        Expanded(
+                          child: _Stat(
+                            label: 'A day so far',
+                            value: moneyShort(
+                              elapsed <= 0 ? total : total ~/ elapsed,
+                              symbol,
+                            ),
                           ),
                         ),
-                        const SizedBox(height: 18),
-                        Row(
-                          children: [
-                            Expanded(
-                              child: _Stat(
-                                label: 'A day so far',
-                                value: moneyShort(
-                                  elapsed <= 0 ? total : total ~/ elapsed,
-                                  symbol,
-                                ),
-                              ),
-                            ),
-                            Container(
-                              width: 1,
-                              height: 30,
-                              color: Theme.of(context)
-                                  .colorScheme
-                                  .outlineVariant,
-                            ),
-                            Expanded(
-                              child: _Stat(
-                                label: 'Biggest slice',
-                                value: byCategory.first.$1,
-                              ),
-                            ),
-                          ],
+                        Container(
+                          width: 1,
+                          height: 30,
+                          color: Theme.of(context).colorScheme.outlineVariant,
+                        ),
+                        Expanded(
+                          child: _Stat(
+                            label: 'Biggest slice',
+                            value: byCategory.first.$1,
+                          ),
+                        ),
+                        Container(
+                          width: 1,
+                          height: 30,
+                          color: Theme.of(context).colorScheme.outlineVariant,
+                        ),
+                        Expanded(
+                          child: _Stat(
+                            label: 'Came in',
+                            value: moneyShort(state.periodIncome, symbol),
+                          ),
                         ),
                       ],
                     ),
-                  ),
+                  ],
                 ),
-                const SectionHeading(title: 'By category'),
-                _Panel(
-                  padding: const EdgeInsets.fromLTRB(16, 6, 16, 10),
-                  child: Column(
-                    children: [
-                      for (final e in byCategory)
-                        _CategoryBar(
-                          category: e.$1,
-                          amountMinor: e.$2,
-                          share: e.$2 / total,
-                          symbol: symbol,
-                        ),
-                    ],
-                  ),
-                ),
-                SectionHeading(
-                  title: 'Day by day',
-                  caption: state.hasBudget
-                      ? '${_dm(period.start)} to '
-                            '${_dm(period.end.subtract(const Duration(days: 1)))} · '
-                            'dashed line is an even '
-                            '${moneyShort(state.budgetMinor ~/ _days(period), symbol)} a day'
-                      : '${_dm(period.start)} to '
-                            '${_dm(period.end.subtract(const Duration(days: 1)))}',
-                ),
-                RepaintBoundary(
-                  child: _Panel(
-                    child: SizedBox(
-                      height: 200,
-                      child: _DailyBarChart(
-                        period: period,
-                        byDay: state.byDay,
-                        budgetMinor: state.budgetMinor,
-                        symbol: symbol,
-                      ),
+              ),
+            ),
+            const SectionHeading(title: 'By category'),
+            _Panel(
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 10),
+              child: Column(
+                children: [
+                  for (final e in byCategory)
+                    _CategoryBar(
+                      category: e.$1,
+                      amountMinor: e.$2,
+                      share: e.$2 / total,
+                      symbol: symbol,
+                      onTap: () => _drillInto(e.$1),
                     ),
+                ],
+              ),
+            ),
+            SectionHeading(
+              title: 'Day by day',
+              caption: state.hasBudget
+                  ? '${_dm(period.start)} to '
+                        '${_dm(period.end.subtract(const Duration(days: 1)))} · '
+                        'dashed line is an even '
+                        '${moneyShort(state.budgetMinor ~/ _days(period), symbol)} a day'
+                  : '${_dm(period.start)} to '
+                        '${_dm(period.end.subtract(const Duration(days: 1)))}',
+            ),
+            RepaintBoundary(
+              child: _Panel(
+                child: SizedBox(
+                  height: 200,
+                  child: _DailyBarChart(
+                    period: period,
+                    byDay: state.byDay,
+                    budgetMinor: state.budgetMinor,
+                    symbol: symbol,
                   ),
                 ),
-                SectionHeading(
-                  title: 'Counted in budget',
-                  caption: state.budgetRowCount > counted.length
-                      ? 'Showing ${counted.length} of ${state.budgetRowCount} transactions'
-                      : '${state.budgetRowCount} transactions',
-                ),
-              ],
+              ),
+            ),
+            SectionHeading(
+              title: 'Counted in budget',
+              caption: state.budgetRowCount > counted.length
+                  ? 'Showing ${counted.length} of ${state.budgetRowCount} transactions'
+                  : '${state.budgetRowCount} transactions',
+            ),
+          ],
+        ),
+        SliverPadding(
+          padding: const EdgeInsets.symmetric(horizontal: 20),
+          sliver: SliverList.builder(
+            itemCount: counted.length,
+            itemBuilder: (context, i) => TransactionTile(
+              transaction: counted[i],
+              symbol: symbol,
+              onTap: () => showTransactionSheet(context, existing: counted[i]),
             ),
           ),
-          SliverPadding(
-            padding: EdgeInsets.fromLTRB(
-              20,
-              0,
-              20,
-              110 + MediaQuery.viewPaddingOf(context).bottom,
-            ),
-            sliver: SliverList.builder(
-              itemCount: counted.length,
-              itemBuilder: (context, i) =>
-                  TransactionTile(transaction: counted[i], symbol: symbol),
-            ),
-          ),
-        ],
-      );
+        ),
+        const PageBottomGap(),
+      ];
     },
   );
+}
+
+/// The two questions Insights can answer: how the budget is doing, and where
+/// the money actually went. They need different scopes, so the switch is on
+/// the screen rather than buried in settings.
+class _ScopeBar extends StatelessWidget {
+  const _ScopeBar();
+
+  @override
+  Widget build(BuildContext context) {
+    final state = appState;
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        SizedBox(
+          height: 38,
+          child: ListView(
+            scrollDirection: Axis.horizontal,
+            padding: EdgeInsets.zero,
+            children: [
+              for (final range in InsightsRange.values) ...[
+                ChoiceChip(
+                  selected: state.insightsRange == range,
+                  label: Text(range.label),
+                  onSelected: (_) =>
+                      unawaited(appState.setInsightsScope(range: range)),
+                ),
+                const SizedBox(width: 8),
+              ],
+            ],
+          ),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          children: [
+            Expanded(
+              child: Text(
+                'Include accounts and rows left out of the budget',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+            Switch(
+              value: !state.insightsBudgetedOnly,
+              activeThumbColor: scheme.primary,
+              onChanged: (all) =>
+                  unawaited(appState.setInsightsScope(budgetedOnly: !all)),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
 }
 
 String _dm(DateTime d) => '${d.day}/${d.month}';
@@ -199,10 +289,12 @@ class _CategoryDonut extends StatelessWidget {
     required this.byCategory,
     required this.total,
     required this.symbol,
+    required this.onTap,
   });
   final List<(String, int)> byCategory;
   final int total;
   final String symbol;
+  final void Function(String category) onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -215,6 +307,18 @@ class _CategoryDonut extends StatelessWidget {
             centerSpaceRadius: 68,
             sectionsSpace: 3,
             startDegreeOffset: -90,
+            // A slice is a way into that category's transactions, so it grows
+            // under the finger and opens the filtered ledger on release.
+            pieTouchData: PieTouchData(
+              touchCallback: (event, response) {
+                final index = response?.touchedSection?.touchedSectionIndex;
+                if (event is FlTapUpEvent &&
+                    index != null &&
+                    index >= 0 &&
+                    index < byCategory.length)
+                  onTap(byCategory[index].$1);
+              },
+            ),
             sections: [
               for (final e in byCategory)
                 PieChartSectionData(
@@ -256,53 +360,59 @@ class _CategoryBar extends StatelessWidget {
     required this.amountMinor,
     required this.share,
     required this.symbol,
+    required this.onTap,
   });
   final String category;
   final int amountMinor;
   final double share;
   final String symbol;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final text = Theme.of(context).textTheme;
     final color = categoryColor(category);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 9),
-      child: Column(
-        children: [
-          Row(
-            children: [
-              Icon(categoryIcon(category), size: 16, color: color),
-              const SizedBox(width: 9),
-              Expanded(child: Text(category, style: text.bodyMedium)),
-              Text(
-                '${(share * 100).round()}%',
-                style: text.bodySmall?.copyWith(fontFeatures: tabular),
-              ),
-              const SizedBox(width: 12),
-              Text(
-                money(amountMinor, symbol),
-                style: text.titleMedium?.copyWith(fontFeatures: tabular),
-              ),
-            ],
-          ),
-          const SizedBox(height: 7),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(3),
-            child: TweenAnimationBuilder<double>(
-              tween: Tween(begin: 0, end: share.clamp(0.0, 1.0)),
-              duration: const Duration(milliseconds: 560),
-              curve: Curves.easeOutCubic,
-              builder: (context, value, _) => LinearProgressIndicator(
-                value: value,
-                minHeight: 5,
-                backgroundColor: scheme.surfaceContainerHigh,
-                valueColor: AlwaysStoppedAnimation(color),
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(Corners.control),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 9),
+        child: Column(
+          children: [
+            Row(
+              children: [
+                Icon(categoryIcon(category), size: 16, color: color),
+                const SizedBox(width: 9),
+                Expanded(child: Text(category, style: text.bodyMedium)),
+                Text(
+                  '${(share * 100).round()}%',
+                  style: text.bodySmall?.copyWith(fontFeatures: tabular),
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  money(amountMinor, symbol),
+                  style: text.titleMedium?.copyWith(fontFeatures: tabular),
+                ),
+              ],
+            ),
+            const SizedBox(height: 7),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(3),
+              child: TweenAnimationBuilder<double>(
+                tween: Tween(begin: 0, end: share.clamp(0.0, 1.0)),
+                duration: const Duration(milliseconds: 560),
+                curve: Curves.easeOutCubic,
+                builder: (context, value, _) => LinearProgressIndicator(
+                  value: value,
+                  minHeight: 5,
+                  backgroundColor: scheme.surfaceContainerHigh,
+                  valueColor: AlwaysStoppedAnimation(color),
+                ),
               ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }

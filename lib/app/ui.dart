@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 
 import '../core/money.dart';
+import '../models/banks.dart';
 import '../models/categories.dart';
+import '../models/category_def.dart';
 import 'theme.dart';
 
 /// A run of content under a heading, with an optional action on the right.
@@ -159,6 +161,7 @@ class EmptyState extends StatelessWidget {
     required this.message,
     this.action,
     this.onAction,
+    this.embedded = false,
   });
 
   final IconData icon;
@@ -167,36 +170,42 @@ class EmptyState extends StatelessWidget {
   final String? action;
   final VoidCallback? onAction;
 
+  /// True when the caller already provides the scroll view and the padding,
+  /// so this renders as a column in place rather than as the whole screen.
+  final bool embedded;
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final text = Theme.of(context).textTheme;
+    final children = [
+      Center(
+        child: Container(
+          width: 72,
+          height: 72,
+          decoration: BoxDecoration(
+            color: scheme.surfaceContainer,
+            borderRadius: BorderRadius.circular(22),
+          ),
+          child: Icon(icon, size: 30, color: scheme.onSurfaceVariant),
+        ),
+      ),
+      const SizedBox(height: 20),
+      Text(title, textAlign: TextAlign.center, style: text.titleLarge),
+      const SizedBox(height: 6),
+      Text(message, textAlign: TextAlign.center, style: text.bodySmall),
+      if (action != null) ...[
+        const SizedBox(height: 22),
+        Center(
+          child: OutlinedButton(onPressed: onAction, child: Text(action!)),
+        ),
+      ],
+    ];
+    if (embedded) return Column(children: children);
     return ListView(
       physics: const AlwaysScrollableScrollPhysics(),
       padding: const EdgeInsets.fromLTRB(36, 90, 36, 40),
-      children: [
-        Center(
-          child: Container(
-            width: 72,
-            height: 72,
-            decoration: BoxDecoration(
-              color: scheme.surfaceContainer,
-              borderRadius: BorderRadius.circular(22),
-            ),
-            child: Icon(icon, size: 30, color: scheme.onSurfaceVariant),
-          ),
-        ),
-        const SizedBox(height: 20),
-        Text(title, textAlign: TextAlign.center, style: text.titleLarge),
-        const SizedBox(height: 6),
-        Text(message, textAlign: TextAlign.center, style: text.bodySmall),
-        if (action != null) ...[
-          const SizedBox(height: 22),
-          Center(
-            child: OutlinedButton(onPressed: onAction, child: Text(action!)),
-          ),
-        ],
-      ],
+      children: children,
     );
   }
 }
@@ -320,7 +329,11 @@ class SpendStrip extends StatelessWidget {
   final Map<DateTime, int> byDay;
   final String symbol;
   final int days;
-  final VoidCallback? onTap;
+
+  /// Tapping a bar shows that day's transactions. It used to open Insights,
+  /// which charted a different period entirely and answered a question
+  /// nobody had asked.
+  final void Function(DateTime day)? onTap;
 
   static const _letters = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
 
@@ -337,45 +350,42 @@ class SpendStrip extends StatelessWidget {
     final amounts = [for (final d in window) byDay[d] ?? 0];
     final peak = amounts.fold<int>(0, (m, v) => v > m ? v : m);
     final busiest = peak == 0 ? null : money(peak, symbol);
-    return InkWell(
-      onTap: onTap,
-      borderRadius: BorderRadius.circular(Corners.card),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 4),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text('Last $days days', style: text.bodySmall),
+              if (busiest != null)
+                Text('busiest day $busiest', style: text.bodySmall),
+            ],
+          ),
+          const SizedBox(height: 10),
+          SizedBox(
+            height: 88,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
               children: [
-                Text('Last $days days', style: text.bodySmall),
-                if (busiest != null)
-                  Text('busiest day $busiest', style: text.bodySmall),
+                for (var i = 0; i < window.length; i++)
+                  Expanded(
+                    child: _Column(
+                      day: window[i],
+                      amount: amounts[i],
+                      peak: peak,
+                      today: window[i] == today,
+                      label: _letters[window[i].weekday - 1],
+                      scheme: scheme,
+                      style: text.labelSmall,
+                      onTap: onTap,
+                    ),
+                  ),
               ],
             ),
-            const SizedBox(height: 10),
-            SizedBox(
-              height: 88,
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.end,
-                children: [
-                  for (var i = 0; i < window.length; i++)
-                    Expanded(
-                      child: _Column(
-                        day: window[i],
-                        amount: amounts[i],
-                        peak: peak,
-                        today: window[i] == today,
-                        label: _letters[window[i].weekday - 1],
-                        scheme: scheme,
-                        style: text.labelSmall,
-                      ),
-                    ),
-                ],
-              ),
-            ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }
@@ -390,6 +400,7 @@ class _Column extends StatelessWidget {
     required this.label,
     required this.scheme,
     required this.style,
+    this.onTap,
   });
 
   final DateTime day;
@@ -399,6 +410,7 @@ class _Column extends StatelessWidget {
   final String label;
   final ColorScheme scheme;
   final TextStyle? style;
+  final void Function(DateTime day)? onTap;
 
   @override
   Widget build(BuildContext context) {
@@ -415,43 +427,47 @@ class _Column extends StatelessWidget {
         : today
         ? scheme.primary
         : scheme.primary.withValues(alpha: 0.30);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 3),
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.end,
-        children: [
-          TweenAnimationBuilder<double>(
-            tween: Tween(begin: 0, end: height),
-            duration: const Duration(milliseconds: 540),
-            curve: Curves.easeOutCubic,
-            builder: (context, value, _) => Container(
-              height: value,
-              // Capped so a bar stays taller than it is wide and reads as a
-              // measurement rather than a block.
-              constraints: const BoxConstraints(maxWidth: 26),
-              decoration: BoxDecoration(
-                color: fill,
-                borderRadius: BorderRadius.circular(6),
+    return InkWell(
+      onTap: onTap == null ? null : () => onTap!(day),
+      borderRadius: BorderRadius.circular(10),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 3),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.end,
+          children: [
+            TweenAnimationBuilder<double>(
+              tween: Tween(begin: 0, end: height),
+              duration: const Duration(milliseconds: 540),
+              curve: Curves.easeOutCubic,
+              builder: (context, value, _) => Container(
+                height: value,
+                // Capped so a bar stays taller than it is wide and reads as a
+                // measurement rather than a block.
+                constraints: const BoxConstraints(maxWidth: 26),
+                decoration: BoxDecoration(
+                  color: fill,
+                  borderRadius: BorderRadius.circular(6),
+                ),
               ),
             ),
-          ),
-          const SizedBox(height: 7),
-          Text(
-            label,
-            style: style?.copyWith(
-              height: 1.2,
-              color: today ? scheme.onSurface : scheme.onSurfaceVariant,
+            const SizedBox(height: 7),
+            Text(
+              label,
+              style: style?.copyWith(
+                height: 1.2,
+                color: today ? scheme.onSurface : scheme.onSurfaceVariant,
+              ),
             ),
-          ),
-          Text(
-            '${day.day}',
-            style: style?.copyWith(
-              height: 1.2,
-              fontWeight: today ? FontWeight.w900 : FontWeight.w600,
-              color: today ? scheme.onSurface : scheme.onSurfaceVariant,
+            Text(
+              '${day.day}',
+              style: style?.copyWith(
+                height: 1.2,
+                fontWeight: today ? FontWeight.w900 : FontWeight.w600,
+                color: today ? scheme.onSurface : scheme.onSurfaceVariant,
+              ),
             ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -465,20 +481,30 @@ class CategoryPicker extends StatelessWidget {
     super.key,
     required this.value,
     required this.onChanged,
+    this.categories,
+    this.onAdd,
   });
 
   final String value;
   final ValueChanged<String> onChanged;
 
+  /// The names to offer, in the user's own order. Falls back to the built-in
+  /// list so a test can build the picker without a database.
+  final List<String>? categories;
+
+  /// Shown as a trailing "New" chip when making one from here makes sense.
+  final VoidCallback? onAdd;
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final text = Theme.of(context).textTheme;
+    final names = categories ?? kCategories;
     return Wrap(
       spacing: 8,
       runSpacing: 8,
       children: [
-        for (final category in kCategories)
+        for (final category in names)
           Builder(
             builder: (context) {
               final color = categoryColor(category);
@@ -518,7 +544,183 @@ class CategoryPicker extends StatelessWidget {
               );
             },
           ),
+        if (onAdd != null)
+          Material(
+            color: Colors.transparent,
+            shape: StadiumBorder(
+              side: BorderSide(color: scheme.outlineVariant, width: 1.5),
+            ),
+            child: InkWell(
+              customBorder: const StadiumBorder(),
+              onTap: onAdd,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(11, 8, 14, 8),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.add_rounded,
+                      size: 15,
+                      color: scheme.onSurfaceVariant,
+                    ),
+                    const SizedBox(width: 6),
+                    Text('New', style: text.bodyMedium),
+                  ],
+                ),
+              ),
+            ),
+          ),
       ],
     );
   }
+}
+
+/// The chip that stands in for a bank logo: its short name on the bank's
+/// colour. See `models/banks.dart` for why Tally draws one instead of
+/// bundling logos.
+class BankMark extends StatelessWidget {
+  const BankMark({super.key, required this.name, this.size = 34});
+
+  final String name;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    final logo = bankLogo(name);
+    if (logo == null) return _chip(context);
+    // Logos are drawn for white stationery, so they get white to sit on in
+    // both themes rather than disappearing into a dark card.
+    return Container(
+      width: size,
+      height: size,
+      padding: EdgeInsets.all(size * 0.1),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(size * 0.28),
+        border: Border.all(
+          color: Theme.of(context).colorScheme.outlineVariant,
+          width: 1,
+        ),
+      ),
+      child: Image.asset(
+        logo,
+        fit: BoxFit.contain,
+        cacheWidth: (size * 3).round(),
+        filterQuality: FilterQuality.medium,
+        errorBuilder: (context, _, _) => _chip(context),
+      ),
+    );
+  }
+
+  Widget _chip(BuildContext context) {
+    final color = bankColor(name);
+    return Container(
+      width: size,
+      height: size,
+      alignment: Alignment.center,
+      padding: EdgeInsets.symmetric(horizontal: size * 0.12),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(size * 0.28),
+      ),
+      child: FittedBox(
+        fit: BoxFit.scaleDown,
+        child: Text(
+          bankMark(name),
+          maxLines: 1,
+          style: TextStyle(
+            fontFamily: 'Nunito',
+            fontSize: size * 0.34,
+            height: 1,
+            fontWeight: FontWeight.w900,
+            letterSpacing: -0.2,
+            color: Colors.white,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Picks one of [kCategoryIconChoices].
+class IconChooser extends StatelessWidget {
+  const IconChooser({
+    super.key,
+    required this.value,
+    required this.color,
+    required this.onChanged,
+  });
+
+  final int value;
+  final Color color;
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return SizedBox(
+      height: 112,
+      child: GridView.builder(
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 8,
+          mainAxisSpacing: 8,
+          crossAxisSpacing: 8,
+        ),
+        itemCount: kCategoryIconChoices.length,
+        itemBuilder: (context, i) {
+          final on = i == value;
+          return Material(
+            color: on ? color.withValues(alpha: 0.18) : scheme.surfaceContainer,
+            borderRadius: BorderRadius.circular(Corners.tile),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(Corners.tile),
+              onTap: () => onChanged(i),
+              child: Icon(
+                kCategoryIconChoices[i],
+                size: 19,
+                color: on ? color : scheme.onSurfaceVariant,
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// Picks one of [kCategoryColorChoices].
+class ColorChooser extends StatelessWidget {
+  const ColorChooser({super.key, required this.value, required this.onChanged});
+
+  final int value;
+  final ValueChanged<int> onChanged;
+
+  @override
+  Widget build(BuildContext context) => Wrap(
+    spacing: 10,
+    runSpacing: 10,
+    children: [
+      for (final argb in kCategoryColorChoices)
+        GestureDetector(
+          onTap: () => onChanged(argb),
+          child: Container(
+            width: 34,
+            height: 34,
+            decoration: BoxDecoration(
+              color: Color(argb),
+              shape: BoxShape.circle,
+              border: Border.all(
+                color: argb == value
+                    ? Theme.of(context).colorScheme.onSurface
+                    : Colors.transparent,
+                width: 2.5,
+              ),
+            ),
+            child: argb == value
+                ? const Icon(Icons.check_rounded, size: 17, color: Colors.white)
+                : null,
+          ),
+        ),
+    ],
+  );
 }

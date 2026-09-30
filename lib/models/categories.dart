@@ -37,8 +37,17 @@ const Map<String, IconData> kCategoryIcons = {
   'Other': Icons.category_rounded,
 };
 
+/// What the user's own category table says, filled once per [AppState] load.
+/// Empty until then, so the built-in tables below stay the answer during
+/// startup and in tests that never touch the database.
+Map<String, (IconData, Color)> _live = const {};
+
+/// Replaces the live set after categories are read or edited.
+void setLiveCategories(Map<String, (IconData, Color)> categories) =>
+    _live = categories;
+
 IconData categoryIcon(String category) =>
-    kCategoryIcons[category] ?? Icons.category_rounded;
+    _live[category]?.$1 ?? kCategoryIcons[category] ?? Icons.category_rounded;
 
 /// Mid-saturation hues chosen to read on both a black and a white surface, so
 /// one palette serves light and dark mode without separate tables.
@@ -57,4 +66,6 @@ const Map<String, Color> kCategoryColors = {
 };
 
 Color categoryColor(String category) =>
-    kCategoryColors[category] ?? kCategoryColors[kUncategorized]!;
+    _live[category]?.$2 ??
+    kCategoryColors[category] ??
+    kCategoryColors[kUncategorized]!;

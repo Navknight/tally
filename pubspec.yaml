@@ -57,6 +57,11 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  # Optional bank logos; see assets/banks/README.md. The folder ships with
+  # only that README, so every bank falls back to its coloured chip.
+  assets:
+    - assets/banks/
+
   fonts:
     - family: Nunito
       fonts:

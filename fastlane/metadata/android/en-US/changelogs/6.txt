@@ -1,5 +1,13 @@
-Redesigned throughout: a period card with a pace marker, the last seven days as a strip, accounts as cards, and Activity grouped by day with pinned headings.
+Redesigned throughout. Every screen now has a large title that collapses as you scroll, cards that actually read as cards, and bank logos on your accounts.
 
-Much faster. Every screen now reads one in-memory store instead of re-querying the database, so switching tabs is instant.
+Much faster. Screens read one in-memory store instead of re-querying, so switching tabs is instant, and the lists that used to build hundreds of rows before painting now build only what you can see.
 
-Jump to any day in Activity. Budget moved into a sheet you open from Home. Investments and SIP debits stay out of the budget.
+New:
+- Search the ledger, and filter by account, category or amount.
+- Tap a day on the week strip, or a slice of the category ring, to see exactly those transactions.
+- Hold a row to select several, then label, exclude or delete them in one go. Select all works on the whole filter, not just what is loaded.
+- Your own categories: rename, recolour, re-mark, add and delete. Deleting asks where its transactions should go.
+- Merge two accounts when SMS detection made duplicates of one.
+- Insights can look at last period, six months or all time, and at every account rather than only the budgeted ones. Plus who took the most money.
+- A row that needs a label now opens straight to the categories, one tap to file it, and tells you how many other rows moved with it.
+- Undo when you swipe a transaction away.

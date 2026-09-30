@@ -3,6 +3,8 @@ import 'package:flutter/foundation.dart';
 import '../core/budget_period.dart';
 import '../data/tally_database.dart';
 import '../models/account.dart';
+import '../models/categories.dart';
+import '../models/category_def.dart';
 import '../models/detected_account.dart';
 import '../models/transaction.dart';
 
@@ -26,7 +28,16 @@ class AppState extends ChangeNotifier {
   int startDay = 1;
   BudgetPeriod period = budgetPeriod(DateTime.now(), 1);
 
+  List<CategoryDef> categories = const [];
+
+  /// How many transactions each category holds, for the manage screen.
+  Map<String, int> categoryCounts = const {};
   List<Account> accounts = const [];
+
+  /// Category names in the user's own order. Falls back to the built-in set
+  /// before the table has been read, so a picker is never empty.
+  List<String> get categoryNames =>
+      categories.isEmpty ? kCategories : [for (final c in categories) c.name];
   Map<int, int> balances = const {};
   List<DetectedAccount> detections = const [];
 
@@ -44,12 +55,24 @@ class AppState extends ChangeNotifier {
   /// showing.
   List<TallyTransaction> recent = const [];
 
-  /// Set when Activity has been jumped back to a chosen day: the ledger then
-  /// starts at that day instead of today. Null is the live view.
-  DateTime? anchor;
+  /// What Activity is narrowed to. One filter drives the search box, the
+  /// account and category chips, the amount bounds, and the drill-down from
+  /// an Insights slice, so those can never disagree about what is on screen.
+  LedgerFilter filter = const LedgerFilter();
+
+  /// How many rows [filter] matches and what they add up to, in and out kept
+  /// apart. Counted by the database, not by the page that was loaded.
+  int ledgerCount = 0;
+  int ledgerOut = 0;
+  int ledgerIn = 0;
 
   /// The first transaction on record, for the date picker's lower bound.
   DateTime? oldest;
+
+  /// False until the inbox has been read once. Tally's whole premise is that
+  /// the ledger fills itself in, so until this is true Home leads with the
+  /// offer to do it rather than leaving it buried in Settings.
+  bool smsScanned = false;
 
   /// Spend per day over the last week, for the strip on Home. Separate from
   /// [byDay], which only covers the budget period and so can be empty on the
@@ -63,6 +86,31 @@ class AppState extends ChangeNotifier {
   Map<DateTime, int> byDay = const {};
   List<TallyTransaction> budgetRows = const [];
   int budgetRowCount = 0;
+  int periodIncome = 0;
+  List<(String, int, int)> topMerchants = const [];
+
+  /// Which period Insights charts, and whether it stays inside the budget.
+  /// Defaults to the budget's own view; widening it answers "where did the
+  /// money go" rather than "how am I doing against the limit".
+  InsightsRange insightsRange = InsightsRange.thisPeriod;
+  bool insightsBudgetedOnly = true;
+
+  /// The range Insights is actually charting, derived from [insightsRange].
+  BudgetPeriod get insightsPeriod => switch (insightsRange) {
+    InsightsRange.thisPeriod => period,
+    InsightsRange.lastPeriod => budgetPeriod(
+      period.start.subtract(const Duration(days: 1)),
+      startDay,
+    ),
+    InsightsRange.sixMonths => BudgetPeriod(
+      DateTime(period.end.year, period.end.month - 6, period.end.day),
+      period.end,
+    ),
+    InsightsRange.everything => BudgetPeriod(
+      oldest ?? DateTime(2000),
+      period.end,
+    ),
+  };
 
   static const _ledgerPage = 60;
 
@@ -119,55 +167,128 @@ class AppState extends ChangeNotifier {
       db.currency(),
       db.setting('monthly_budget'),
       db.budgetStartDay(),
+      db.setting('sms_last_seen'),
     ]);
     symbol = settings[0] as String;
     budgetMinor = int.tryParse(settings[1] as String? ?? '') ?? 0;
     startDay = settings[2] as int;
+    smsScanned = (settings[3] as String?) != null;
     period = budgetPeriod(DateTime.now(), startDay);
 
     final data = await Future.wait([
+      db.categories(),
       db.accounts(),
       db.accountBalancesSql(),
       db.detectedAccounts(),
       db.transactions(
         limit: ledgerLimit + 1,
-        before: anchor?.add(const Duration(days: 1)),
+        from: filter.from,
+        to: filter.to,
+        category: filter.category,
+        accountId: filter.accountId,
+        search: filter.text,
+        minMinor: filter.minMinor,
+        maxMinor: filter.maxMinor,
       ),
-      db.reviewQueue(),
+      db.reviewQueue(limit: 500),
       db.spentInPeriodSql(period),
-      db.spendByCategory(period),
-      db.dailySpend(period),
-      db.budgetRowsPage(period),
+      db.spendByCategory(insightsPeriod, budgetedOnly: insightsBudgetedOnly),
+      db.dailySpend(insightsPeriod, budgetedOnly: insightsBudgetedOnly),
+      db.budgetRowsPage(insightsPeriod, budgetedOnly: insightsBudgetedOnly),
       db.dailySpend(_lastWeek()),
       db.transactions(limit: 6),
       db.oldestTransaction(),
+      db.ledgerSummary(
+        from: filter.from,
+        to: filter.to,
+        category: filter.category,
+        accountId: filter.accountId,
+        search: filter.text,
+        minMinor: filter.minMinor,
+        maxMinor: filter.maxMinor,
+      ),
+      db.incomeInPeriod(insightsPeriod, budgetedOnly: insightsBudgetedOnly),
+      db.categoryUsage(),
+      db.topMerchants(insightsPeriod, budgetedOnly: insightsBudgetedOnly),
     ]);
-    accounts = data[0] as List<Account>;
-    balances = data[1] as Map<int, int>;
-    detections = data[2] as List<DetectedAccount>;
-    final rows = data[3] as List<TallyTransaction>;
+    categories = data[0] as List<CategoryDef>;
+    // Icons and colours come from the table, so a recoloured or renamed
+    // category takes effect everywhere at once.
+    setLiveCategories({for (final c in categories) c.name: (c.icon, c.color)});
+    accounts = data[1] as List<Account>;
+    balances = data[2] as Map<int, int>;
+    detections = data[3] as List<DetectedAccount>;
+    final rows = data[4] as List<TallyTransaction>;
     hasMore = rows.length > ledgerLimit;
     ledger = hasMore ? rows.sublist(0, ledgerLimit) : rows;
     ledgerDays = groupByDay(ledger);
-    review = data[4] as List<TallyTransaction>;
-    spent = data[5] as int;
-    byCategory = data[6] as List<(String, int)>;
-    byDay = data[7] as Map<DateTime, int>;
-    final page = data[8] as (List<TallyTransaction>, int);
+    review = data[5] as List<TallyTransaction>;
+    spent = data[6] as int;
+    byCategory = data[7] as List<(String, int)>;
+    byDay = data[8] as Map<DateTime, int>;
+    final page = data[9] as (List<TallyTransaction>, int);
     budgetRows = page.$1;
     budgetRowCount = page.$2;
-    lastWeek = data[9] as Map<DateTime, int>;
-    recent = data[10] as List<TallyTransaction>;
-    oldest = data[11] as DateTime?;
+    lastWeek = data[10] as Map<DateTime, int>;
+    recent = data[11] as List<TallyTransaction>;
+    oldest = data[12] as DateTime?;
+    final summary = data[13] as (int, int, int);
+    ledgerCount = summary.$1;
+    ledgerOut = summary.$2;
+    ledgerIn = summary.$3;
+    periodIncome = data[14] as int;
+    categoryCounts = data[15] as Map<String, int>;
+    topMerchants = data[16] as List<(String, int, int)>;
   }
 
-  /// Points Activity at [day], or back at today when it is null. Paging
-  /// starts over, since the window moved.
-  Future<void> jumpTo(DateTime? day) {
-    anchor = day == null ? null : DateTime(day.year, day.month, day.day);
+  /// Every id the current filter matches, for selecting a whole filtered set
+  /// rather than only the page that has been loaded.
+  Future<List<int>> filteredIds() => TallyDatabase.instance.ledgerIds(
+    from: filter.from,
+    to: filter.to,
+    category: filter.category,
+    accountId: filter.accountId,
+    search: filter.text,
+    minMinor: filter.minMinor,
+    maxMinor: filter.maxMinor,
+  );
+
+  Future<void> setInsightsScope({InsightsRange? range, bool? budgetedOnly}) {
+    insightsRange = range ?? insightsRange;
+    insightsBudgetedOnly = budgetedOnly ?? insightsBudgetedOnly;
+    return load();
+  }
+
+  /// Narrows Activity. Paging starts over, since the window changed.
+  Future<void> setFilter(LedgerFilter next) {
+    filter = next;
     ledgerLimit = _ledgerPage;
     return load();
   }
+
+  /// Drops every narrowing at once.
+  Future<void> clearFilter() => setFilter(const LedgerFilter());
+
+  /// Rewinds Activity to [day]: that day and everything before it. Null goes
+  /// back to the live view.
+  Future<void> jumpTo(DateTime? day) => setFilter(
+    day == null
+        ? filter.copyWith(clearDates: true)
+        : filter.copyWith(
+            to: DateTime(day.year, day.month, day.day + 1),
+            clearFrom: true,
+          ),
+  );
+
+  /// Shows exactly one day, which is what tapping a bar on Home's strip
+  /// means - the old behaviour sent you to Insights for a different period
+  /// entirely.
+  Future<void> showDay(DateTime day) => setFilter(
+    filter.copyWith(
+      from: DateTime(day.year, day.month, day.day),
+      to: DateTime(day.year, day.month, day.day + 1),
+    ),
+  );
 
   /// The seven days ending today, as a period the daily-spend query accepts.
   static BudgetPeriod _lastWeek() {
@@ -215,4 +336,81 @@ List<LedgerDay> groupByDay(List<TallyTransaction> rows) {
     start = end;
   }
   return days;
+}
+
+/// What Activity is narrowed to: free text over the merchant and note, one
+/// category, one account, or any combination. Every field empty is the whole
+/// ledger.
+class LedgerFilter {
+  const LedgerFilter({
+    this.text = '',
+    this.category,
+    this.accountId,
+    this.minMinor,
+    this.maxMinor,
+    this.from,
+    this.to,
+  });
+
+  final String text;
+  final String? category;
+  final int? accountId;
+
+  /// Half-open date window. [from] alone is "since", [to] alone is "up to",
+  /// and both together is one day or one stretch.
+  final DateTime? from;
+  final DateTime? to;
+
+  /// Amount bounds in minor units, either end optional: "everything over
+  /// 1,000" is as useful a question as a band.
+  final int? minMinor;
+  final int? maxMinor;
+
+  bool get isEmpty =>
+      text.isEmpty &&
+      category == null &&
+      accountId == null &&
+      minMinor == null &&
+      maxMinor == null &&
+      from == null &&
+      to == null;
+
+  /// True when the window is exactly one day, which reads differently in the
+  /// filter bar than an open-ended "and earlier".
+  bool get isSingleDay =>
+      from != null && to != null && to!.difference(from!).inHours <= 25;
+
+  LedgerFilter copyWith({
+    String? text,
+    String? category,
+    int? accountId,
+    int? minMinor,
+    int? maxMinor,
+    DateTime? from,
+    DateTime? to,
+    bool clearCategory = false,
+    bool clearAccount = false,
+    bool clearAmount = false,
+    bool clearDates = false,
+    bool clearFrom = false,
+  }) => LedgerFilter(
+    text: text ?? this.text,
+    category: clearCategory ? null : (category ?? this.category),
+    accountId: clearAccount ? null : (accountId ?? this.accountId),
+    minMinor: clearAmount ? null : (minMinor ?? this.minMinor),
+    maxMinor: clearAmount ? null : (maxMinor ?? this.maxMinor),
+    from: clearDates || clearFrom ? null : (from ?? this.from),
+    to: clearDates ? null : (to ?? this.to),
+  );
+}
+
+/// The stretch of time Insights charts.
+enum InsightsRange {
+  thisPeriod('This period'),
+  lastPeriod('Last period'),
+  sixMonths('6 months'),
+  everything('All time');
+
+  const InsightsRange(this.label);
+  final String label;
 }

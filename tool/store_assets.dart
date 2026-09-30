@@ -57,14 +57,14 @@ void _seed() {
   s.accounts = const [
     Account(
       id: 1,
-      name: 'Salary account',
+      name: 'HDFC Savings',
       last4: '4417',
       openingBalanceMinor: 0,
     ),
-    Account(id: 2, name: 'Savings', last4: '9082', openingBalanceMinor: 0),
+    Account(id: 2, name: 'SBI Deposit', last4: '9082', openingBalanceMinor: 0),
     Account(
       id: 3,
-      name: 'Travel card',
+      name: 'Amazon Pay ICICI',
       last4: '3301',
       openingBalanceMinor: 0,
       kind: AccountKind.card,
@@ -299,12 +299,12 @@ void main() {
       await _shot(t, const TransactionsScreen(), '2-activity');
     });
     testWidgets('3 insights', (t) async {
-      await _shot(t, const InsightsScreen(), '3-insights');
+      await _shot(t, InsightsScreen(onOpenActivity: () {}), '3-insights');
     });
     testWidgets('4 insights dark', (t) async {
       await _shot(
         t,
-        const InsightsScreen(),
+        InsightsScreen(onOpenActivity: () {}),
         '4-categories',
         mode: Brightness.dark,
         drag: 620,
